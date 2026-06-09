@@ -12,6 +12,10 @@ import { CanvasNodeType, type CanvasNodeData, type Position } from "../types";
 type ResizeCorner = "top-left" | "top-right" | "bottom-left" | "bottom-right";
 const selectionBlue = "#2f80ff";
 const REMOVE_BACKGROUND_PROMPT_PREFIXES = ["Remove the original background", "Remove the background completely"];
+const DEFAULT_RESIZE_MIN_SIZE = { width: 220, height: 160 };
+const CONTENT_IMAGE_RESIZE_MIN_SIZE = { width: 16, height: 16 };
+const LAYER_TEXT_RESIZE_MIN_SIZE = { width: 8, height: 8 };
+const VIDEO_RESIZE_MIN_SIZE = { width: 120, height: 68 };
 
 function isRemoveBackgroundResultNode(node: CanvasNodeData) {
     const prompt = node.metadata?.prompt?.trim() || "";
@@ -20,6 +24,17 @@ function isRemoveBackgroundResultNode(node: CanvasNodeData) {
 
 function isLayerTextNode(node: CanvasNodeData) {
     return node.type === CanvasNodeType.Text && Boolean(node.metadata?.layerText);
+}
+
+function resizeMinSize(node: CanvasNodeData) {
+    if (isLayerTextNode(node)) return LAYER_TEXT_RESIZE_MIN_SIZE;
+    if (node.type === CanvasNodeType.Image && node.metadata?.content) return CONTENT_IMAGE_RESIZE_MIN_SIZE;
+    if (node.type === CanvasNodeType.Video && node.metadata?.content) return VIDEO_RESIZE_MIN_SIZE;
+    return DEFAULT_RESIZE_MIN_SIZE;
+}
+
+function clampLayerTextFontSize(fontSize: number) {
+    return Math.max(6, Math.min(360, Math.round(fontSize)));
 }
 
 type CanvasNodeProps = {
@@ -45,7 +60,7 @@ type CanvasNodeProps = {
     onHoverStart: (nodeId: string) => void;
     onHoverEnd: (nodeId: string) => void;
     onConnectStart: (event: React.MouseEvent, nodeId: string, handleType: "source" | "target") => void;
-    onResize: (nodeId: string, width: number, height: number, position?: Position) => void;
+    onResize: (nodeId: string, width: number, height: number, position?: Position, metadataPatch?: Partial<CanvasNodeData["metadata"]>) => void;
     onContentChange: (nodeId: string, content: string) => void;
     onToggleBatch?: (nodeId: string) => void;
     onSetBatchPrimary?: (node: CanvasNodeData) => void;
@@ -129,6 +144,10 @@ export const CanvasNode = React.memo(function CanvasNode({
         startHeight: 0,
         keepRatio: false,
         ratio: 1,
+        minWidth: DEFAULT_RESIZE_MIN_SIZE.width,
+        minHeight: DEFAULT_RESIZE_MIN_SIZE.height,
+        isLayerText: false,
+        startFontSize: 14,
     });
 
     useEffect(() => {
@@ -173,8 +192,8 @@ export const CanvasNode = React.memo(function CanvasNode({
 
             const dx = (event.clientX - resizeRef.current.startX) / scale;
             const dy = (event.clientY - resizeRef.current.startY) / scale;
-            const minWidth = 220;
-            const minHeight = 160;
+            const minWidth = resizeRef.current.minWidth;
+            const minHeight = resizeRef.current.minHeight;
             const startRight = resizeRef.current.startLeft + resizeRef.current.startWidth;
             const startBottom = resizeRef.current.startTop + resizeRef.current.startHeight;
             const fromLeft = resizeRef.current.corner.includes("left");
@@ -200,10 +219,21 @@ export const CanvasNode = React.memo(function CanvasNode({
                 }
             }
 
-            onResize(data.id, width, height, {
-                x: fromLeft ? startRight - width : resizeRef.current.startLeft,
-                y: fromTop ? startBottom - height : resizeRef.current.startTop,
-            });
+            const widthRatio = width / Math.max(1, resizeRef.current.startWidth);
+            const heightRatio = height / Math.max(1, resizeRef.current.startHeight);
+            const dominantTextScale = Math.abs(widthRatio - 1) >= Math.abs(heightRatio - 1) ? widthRatio : heightRatio;
+            const metadataPatch = resizeRef.current.isLayerText ? { fontSize: clampLayerTextFontSize(resizeRef.current.startFontSize * dominantTextScale) } : undefined;
+
+            onResize(
+                data.id,
+                width,
+                height,
+                {
+                    x: fromLeft ? startRight - width : resizeRef.current.startLeft,
+                    y: fromTop ? startBottom - height : resizeRef.current.startTop,
+                },
+                metadataPatch,
+            );
         },
         [data.id, onResize, scale],
     );
@@ -217,6 +247,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     const handleResizeMouseDown = (event: React.MouseEvent, corner: ResizeCorner) => {
         event.stopPropagation();
         event.preventDefault();
+        const minSize = resizeMinSize(data);
         resizeRef.current = {
             isResizing: true,
             corner,
@@ -228,6 +259,10 @@ export const CanvasNode = React.memo(function CanvasNode({
             startHeight: data.height,
             keepRatio: (data.type === CanvasNodeType.Image && !data.metadata?.freeResize) || data.type === CanvasNodeType.Video,
             ratio: (data.metadata?.naturalWidth || data.width) / (data.metadata?.naturalHeight || data.height || 1),
+            minWidth: minSize.width,
+            minHeight: minSize.height,
+            isLayerText,
+            startFontSize: data.metadata?.fontSize || 14,
         };
         window.addEventListener("mousemove", handleResizeMove);
         window.addEventListener("mouseup", handleResizeUp);

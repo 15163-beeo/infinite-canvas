@@ -1442,8 +1442,20 @@ function InfiniteCanvasPage() {
         [screenToCanvas, setConnecting],
     );
 
-    const handleNodeResize = useCallback((nodeId: string, width: number, height: number, position?: Position) => {
-        setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, width, height, position: position || node.position } : node)));
+    const handleNodeResize = useCallback((nodeId: string, width: number, height: number, position?: Position, metadataPatch?: Partial<CanvasNodeData["metadata"]>) => {
+        setNodes((prev) =>
+            prev.map((node) =>
+                node.id === nodeId
+                    ? {
+                          ...node,
+                          width,
+                          height,
+                          position: position || node.position,
+                          metadata: metadataPatch ? { ...node.metadata, ...metadataPatch } : node.metadata,
+                      }
+                    : node,
+            ),
+        );
     }, []);
 
     const toggleNodeFreeResize = useCallback((nodeId: string) => {
