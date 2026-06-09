@@ -16,6 +16,7 @@ const DEFAULT_RESIZE_MIN_SIZE = { width: 220, height: 160 };
 const CONTENT_IMAGE_RESIZE_MIN_SIZE = { width: 16, height: 16 };
 const LAYER_TEXT_RESIZE_MIN_SIZE = { width: 8, height: 8 };
 const VIDEO_RESIZE_MIN_SIZE = { width: 120, height: 68 };
+const LAYER_TEXT_LINE_HEIGHT = 1.16;
 
 function isRemoveBackgroundResultNode(node: CanvasNodeData) {
     const prompt = node.metadata?.prompt?.trim() || "";
@@ -35,6 +36,20 @@ function resizeMinSize(node: CanvasNodeData) {
 
 function clampLayerTextFontSize(fontSize: number) {
     return Math.max(6, Math.min(360, Math.round(fontSize)));
+}
+
+function layerTextFrameSize(node: CanvasNodeData) {
+    const fontSize = Math.max(1, node.metadata?.fontSize || 14);
+    const content = node.metadata?.content || " ";
+    const width = Math.max(LAYER_TEXT_RESIZE_MIN_SIZE.width, Math.ceil(node.width));
+    const averageCharWidth = Math.max(1, fontSize * 0.62);
+    const charsPerLine = Math.max(1, Math.floor(width / averageCharWidth));
+    const lineCount = content.split(/\r?\n/).reduce((total, line) => total + Math.max(1, Math.ceil(Array.from(line || " ").length / charsPerLine)), 0);
+    const minHeight = Math.ceil(lineCount * fontSize * LAYER_TEXT_LINE_HEIGHT + fontSize * 0.18);
+    return {
+        width,
+        height: Math.max(LAYER_TEXT_RESIZE_MIN_SIZE.height, Math.ceil(node.height), minHeight),
+    };
 }
 
 type CanvasNodeProps = {
@@ -132,6 +147,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     const isRemoveBackgroundNode = isRemoveBackgroundResultNode(data);
     const isActive = isConnectionTarget || isSelected || isFocusRelated;
     const imageBorderColor = isActive ? selectionBlue : isRelated && !isBatchChild ? theme.node.muted : "transparent";
+    const frameSize = isLayerText ? layerTextFrameSize(data) : { width: data.width, height: data.height };
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const resizeRef = useRef({
         isResizing: false,
@@ -170,6 +186,12 @@ export const CanvasNode = React.memo(function CanvasNode({
         if (!editRequestNonce || data.type !== CanvasNodeType.Text) return;
         setIsEditingContent(true);
     }, [data.type, editRequestNonce]);
+
+    useEffect(() => {
+        if (!isLayerText || resizeRef.current.isResizing) return;
+        if (frameSize.width <= data.width && frameSize.height <= data.height) return;
+        onResize(data.id, frameSize.width, frameSize.height);
+    }, [data.height, data.id, data.width, frameSize.height, frameSize.width, isLayerText, onResize]);
 
     useEffect(() => {
         if (!isEditingContent) return;
@@ -255,10 +277,10 @@ export const CanvasNode = React.memo(function CanvasNode({
             startY: event.clientY,
             startLeft: data.position.x,
             startTop: data.position.y,
-            startWidth: data.width,
-            startHeight: data.height,
+            startWidth: frameSize.width,
+            startHeight: frameSize.height,
             keepRatio: (data.type === CanvasNodeType.Image && !data.metadata?.freeResize) || data.type === CanvasNodeType.Video,
-            ratio: (data.metadata?.naturalWidth || data.width) / (data.metadata?.naturalHeight || data.height || 1),
+            ratio: (data.metadata?.naturalWidth || frameSize.width) / (data.metadata?.naturalHeight || frameSize.height || 1),
             minWidth: minSize.width,
             minHeight: minSize.height,
             isLayerText,
@@ -283,8 +305,8 @@ export const CanvasNode = React.memo(function CanvasNode({
                 transform: `translate(${data.position.x}px, ${data.position.y}px)`,
                 transformOrigin: "left top",
                 ...(isLayerText && data.metadata?.rotation ? { transform: `translate(${data.position.x}px, ${data.position.y}px) rotate(${data.metadata.rotation}deg)` } : {}),
-                width: data.width,
-                height: data.height,
+                width: frameSize.width,
+                height: frameSize.height,
                 transition: "box-shadow 200ms ease",
                 contain: "layout style",
             }}

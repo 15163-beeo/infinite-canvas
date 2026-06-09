@@ -1559,7 +1559,7 @@ function InfiniteCanvasPage() {
             try {
                 const result = await buildLayerGroupPsd(node, nodesRef.current, connectionsRef.current);
                 saveAs(result.blob, result.fileName);
-                message.open({ key, type: "success", content: `已导出 ${result.layerCount} 个 PSD 图层` });
+                message.open({ key, type: "success", content: `已导出当前分层组 PSD（${result.layerCount} 层）` });
             } catch (error) {
                 message.open({ key, type: "error", content: error instanceof Error ? error.message : "PSD 导出失败" });
             }
