@@ -1,0 +1,10 @@
+.git
+.idea
+docs
+data
+web/.next
+web/node_modules
+web/out
+*.log
+.env*
+!.env.example

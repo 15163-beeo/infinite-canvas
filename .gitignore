@@ -1,0 +1,15 @@
+.next/
+out/
+node_modules/
+.cache/
+.local/
+__pycache__/
+*.pyc
+.env*
+!.env.example
+data/
+*.log
+*.exe
+*.tsbuildinfo
+.DS_Store
+.idea
