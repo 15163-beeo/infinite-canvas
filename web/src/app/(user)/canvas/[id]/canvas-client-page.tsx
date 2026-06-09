@@ -20,6 +20,7 @@ import { useAssetStore } from "@/stores/use-asset-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { cropDataUrl } from "../utils/canvas-image-data";
 import { fitNodeSize, nodeSizeFromRatio } from "../utils/canvas-node-size";
+import { buildLayerGroupPsd, collectPsdLayerNodes } from "../utils/canvas-psd-export";
 import { App, Button, Dropdown, Modal } from "antd";
 import { NODE_DEFAULT_SIZE, getNodeSpec } from "../constants";
 import { ActiveConnectionPath, ConnectionPath } from "../components/canvas-connections";
@@ -635,6 +636,7 @@ function InfiniteCanvasPage() {
     const cropNode = cropNodeId ? nodeById.get(cropNodeId) || null : null;
     const angleNode = angleNodeId ? nodeById.get(angleNodeId) || null : null;
     const previewNode = previewNodeId ? nodeById.get(previewNodeId) || null : null;
+    const toolbarPsdLayerNodes = useMemo(() => (toolbarNode ? collectPsdLayerNodes(toolbarNode, nodes, connections) : []), [connections, nodes, toolbarNode]);
     const hasMultipleSelectedNodes = selectedNodeIds.size > 1;
     const activeNodeId = hasMultipleSelectedNodes ? null : hoveredNodeId || (selectedNodeIds.size === 1 ? Array.from(selectedNodeIds)[0] : null);
     const batchChildCountById = useMemo(() => {
@@ -1550,6 +1552,21 @@ function InfiniteCanvasPage() {
         saveAs(node.metadata.content, `canvas-${node.type}-${node.id}.${node.type === CanvasNodeType.Video ? "mp4" : imageExtension(node.metadata.content)}`);
     }, []);
 
+    const exportLayerPsd = useCallback(
+        async (node: CanvasNodeData) => {
+            const key = `export-psd-${node.id}`;
+            message.open({ key, type: "loading", content: "正在导出 PSD...", duration: 0 });
+            try {
+                const result = await buildLayerGroupPsd(node, nodesRef.current, connectionsRef.current);
+                saveAs(result.blob, result.fileName);
+                message.open({ key, type: "success", content: `已导出 ${result.layerCount} 个 PSD 图层` });
+            } catch (error) {
+                message.open({ key, type: "error", content: error instanceof Error ? error.message : "PSD 导出失败" });
+            }
+        },
+        [message],
+    );
+
     const saveNodeAsset = useCallback(
         async (node: CanvasNodeData) => {
             if (node.type === CanvasNodeType.Text) {
@@ -1744,6 +1761,8 @@ function InfiniteCanvasPage() {
                 const scaleX = sourceMetrics.displayWidth / Math.max(1, result.originalWidth);
                 const scaleY = sourceMetrics.displayHeight / Math.max(1, result.originalHeight);
                 const derivedMetadata = buildDerivedImageMetadata(reference);
+                const layerGroupId = nanoid();
+                const layerSourceId = node.id;
                 const layerNodes: CanvasNodeData[] = [];
                 const layerConnections: CanvasConnection[] = [];
 
@@ -1756,7 +1775,7 @@ function InfiniteCanvasPage() {
                         position: { x: baseX, y: baseY },
                         width: sourceMetrics.displayWidth,
                         height: sourceMetrics.displayHeight,
-                        metadata: { ...imageMetadata(backgroundImage), ...derivedMetadata },
+                        metadata: { ...imageMetadata(backgroundImage), ...derivedMetadata, layerGroupId, layerSourceId, layerRole: "background" },
                     });
                     layerConnections.push({ id: nanoid(), fromNodeId: node.id, toNodeId: backgroundId });
                 }
@@ -1773,7 +1792,7 @@ function InfiniteCanvasPage() {
                         },
                         width: Math.max(1, result.productWidth * scaleX || productImage.width),
                         height: Math.max(1, result.productHeight * scaleY || productImage.height),
-                        metadata: { ...imageMetadata(productImage), ...derivedMetadata },
+                        metadata: { ...imageMetadata(productImage), ...derivedMetadata, layerGroupId, layerSourceId, layerRole: "product" },
                     });
                     layerConnections.push({ id: nanoid(), fromNodeId: node.id, toNodeId: productId });
                 }
@@ -1788,6 +1807,8 @@ function InfiniteCanvasPage() {
                     productOffsetY: result.productOffsetY,
                     productWidth: productImage ? result.productWidth : 0,
                     productHeight: productImage ? result.productHeight : 0,
+                    layerGroupId,
+                    layerSourceId,
                 });
                 textNodes.forEach((textNode) => {
                     layerNodes.push(textNode);
@@ -2714,6 +2735,8 @@ function InfiniteCanvasPage() {
                     onGenerateImage={generateImageFromTextNode}
                     onUpload={(node) => handleUploadRequest(node.id)}
                     onDownload={downloadNodeImage}
+                    canExportPsd={toolbarPsdLayerNodes.length > 0}
+                    onExportPsd={(node) => void exportLayerPsd(node)}
                     onSaveAsset={(node) => void saveNodeAsset(node)}
                     onCrop={(node) => setCropNodeId(node.id)}
                     onAngle={(node) => setAngleNodeId(node.id)}
@@ -3091,6 +3114,8 @@ type LayerTextLayout = {
     productOffsetY: number;
     productWidth: number;
     productHeight: number;
+    layerGroupId: string;
+    layerSourceId: string;
 };
 
 function createLayerTextNodes(textLayers: LayerImageTextLayer[], layout: LayerTextLayout): CanvasNodeData[] {
@@ -3137,6 +3162,9 @@ function createLayerTextNodes(textLayers: LayerImageTextLayer[], layout: LayerTe
                     textOpacity: typeof layer.opacity === "number" ? layer.opacity : 1,
                     rotation: layer.rotation || 0,
                     layerText: true,
+                    layerGroupId: layout.layerGroupId,
+                    layerSourceId: layout.layerSourceId,
+                    layerRole: "text",
                 },
             },
         ];

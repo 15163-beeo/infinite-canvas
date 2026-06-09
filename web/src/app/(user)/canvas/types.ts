@@ -35,6 +35,9 @@ export type CanvasNodeMetadata = {
     textOpacity?: number;
     rotation?: number;
     layerText?: boolean;
+    layerGroupId?: string;
+    layerSourceId?: string;
+    layerRole?: "background" | "product" | "text";
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
