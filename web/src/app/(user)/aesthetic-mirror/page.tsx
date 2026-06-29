@@ -25,6 +25,9 @@ type MirrorResult = {
     id: string;
     status: MirrorStatus;
     prompt: string;
+    referenceId?: string;
+    referenceName?: string;
+    referenceIndex?: number;
     dataUrl?: string;
     error?: string;
 };
@@ -65,6 +68,7 @@ type AspectRatio = "1:1" | "3:4" | "4:5" | "9:16" | "16:9";
 type ImageSize = "auto" | "1K" | "2K";
 
 const maxProductImages = 6;
+const maxReferenceImages = 20;
 const maxMirrorHistoryLogs = 50;
 const promptTemplateStorageKey = "infinite-canvas:aesthetic-mirror:prompt-template";
 const mirrorHistoryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "aesthetic_mirror_logs" });
@@ -132,6 +136,8 @@ export default function AestheticMirrorPage() {
     const finalPrompt = useMemo(() => buildFinalPrompt(promptTemplate, extraPrompt), [promptTemplate, extraPrompt]);
     const promptDraftFinal = useMemo(() => buildFinalPrompt(promptDraft, extraPrompt), [promptDraft, extraPrompt]);
     const modelChannelName = useMemo(() => resolveModelChannelName(effectiveConfig, modelChannelId, model), [effectiveConfig, model, modelChannelId]);
+    const isBatchMode = referenceImages.length > 1;
+    const effectiveResultCount = isBatchMode ? referenceImages.length : imageCount;
     const canGenerate = referenceImages.length > 0 && productImages.length > 0 && !isGenerating;
     const successCount = results.filter((item) => item.status === "success").length;
 
@@ -155,9 +161,11 @@ export default function AestheticMirrorPage() {
     const uploadFiles = async (sourceFiles: File[], role: UploadRole) => {
         const files = sourceFiles.filter((file) => file.type.startsWith("image/"));
         if (!files.length) return;
-        const limitedFiles = role === "reference" ? files.slice(0, 1) : files.slice(0, Math.max(0, maxProductImages - productImages.length));
+        const maxImages = role === "reference" ? maxReferenceImages : maxProductImages;
+        const currentCount = role === "reference" ? referenceImages.length : productImages.length;
+        const limitedFiles = files.slice(0, Math.max(0, maxImages - currentCount));
         if (!limitedFiles.length) {
-            message.warning(`产品素材最多上传 ${maxProductImages} 张`);
+            message.warning(role === "reference" ? `参考设计图最多上传 ${maxReferenceImages} 张` : `产品素材最多上传 ${maxProductImages} 张`);
             return;
         }
         const hide = message.loading("正在读取图片...", 0);
@@ -180,8 +188,7 @@ export default function AestheticMirrorPage() {
                 }),
             );
             if (role === "reference") {
-                await cleanupStoredImages(referenceImages);
-                setReferenceImages(nextImages.slice(0, 1));
+                setReferenceImages((items) => [...items, ...nextImages].slice(0, maxReferenceImages));
             } else {
                 setProductImages((items) => [...items, ...nextImages].slice(0, maxProductImages));
             }
@@ -224,7 +231,8 @@ export default function AestheticMirrorPage() {
             return;
         }
 
-        const count = override?.count || imageCount;
+        const isBatchRun = referenceImages.length > 1 && !override?.replaceId;
+        const count = isBatchRun ? referenceImages.length : override?.count || imageCount;
         const startedAt = performance.now();
         const historySnapshot = {
             prompt: finalPrompt,
@@ -240,7 +248,16 @@ export default function AestheticMirrorPage() {
             references: [...referenceImages],
             products: [...productImages],
         };
-        const slots = Array.from({ length: count }, () => ({ id: nanoid(), status: "running" as const, prompt: finalPrompt }));
+        const slots = isBatchRun
+            ? referenceImages.map((reference, index) => ({
+                  id: nanoid(),
+                  status: "running" as const,
+                  prompt: finalPrompt,
+                  referenceId: reference.id,
+                  referenceName: reference.name,
+                  referenceIndex: index,
+              }))
+            : Array.from({ length: count }, () => ({ id: nanoid(), status: "running" as const, prompt: finalPrompt }));
         if (override?.replaceId) {
             setResults((items) => items.map((item) => (item.id === override.replaceId ? slots[0] : item)));
         } else {
@@ -251,7 +268,31 @@ export default function AestheticMirrorPage() {
         const historyLogMeta = pendingLog ? { id: pendingLog.id, createdAt: pendingLog.createdAt } : {};
 
         try {
-            const requestConfig = buildRequestConfig(requestBaseConfig, requestModel, requestChannelId, aspectRatio, imageSize, quality, count);
+            const requestConfig = buildRequestConfig(requestBaseConfig, requestModel, requestChannelId, aspectRatio, imageSize, quality, isBatchRun ? 1 : count);
+            if (isBatchRun) {
+                const batchItems = await Promise.all(
+                    referenceImages.map(async (reference, index) => {
+                        try {
+                            const images = await requestEdit(requestConfig, finalPrompt, [reference, ...productImages]);
+                            const image = images[0];
+                            if (!image?.dataUrl) throw new Error("接口没有返回这张图片");
+                            setResults((items) => items.map((item) => (item.id === slots[index].id ? { ...item, status: "success", dataUrl: image.dataUrl } : item)));
+                            return { status: "success" as const, image };
+                        } catch (error) {
+                            const errorMessage = error instanceof Error ? error.message : "生成失败";
+                            setResults((items) => items.map((item) => (item.id === slots[index].id ? { ...item, status: "failed", error: errorMessage } : item)));
+                            return { status: "failed" as const, error: errorMessage };
+                        }
+                    }),
+                );
+                const images = batchItems.filter((item): item is { status: "success"; image: { id: string; dataUrl: string } } => item.status === "success").map((item) => item.image);
+                const errors = batchItems.filter((item): item is { status: "failed"; error: string } => item.status === "failed").map((item) => item.error);
+                if (images.length > 0) message.success(`已生成 ${images.length}/${count} 张详情图`);
+                if (!images.length) message.error(errors[0] || "生成失败");
+                else if (errors.length) message.warning(`有 ${errors.length} 张生成失败`);
+                void saveHistoryFromSnapshot({ ...historySnapshot, ...historyLogMeta, status: images.length ? "成功" : "失败", images, errors, durationMs: performance.now() - startedAt });
+                return;
+            }
             const images = await requestEdit(requestConfig, finalPrompt, [...referenceImages, ...productImages]);
             setResults((items) => {
                 const targetIds = override?.replaceId ? [slots[0].id] : slots.map((slot) => slot.id);
@@ -361,7 +402,7 @@ export default function AestheticMirrorPage() {
     };
 
     const restoreHistoryLog = (log: MirrorHistoryLog) => {
-        setReferenceImages(log.references.slice(0, 1));
+        setReferenceImages(log.references.slice(0, maxReferenceImages));
         setProductImages(log.products.slice(0, maxProductImages));
         setPromptTemplate(log.promptTemplate || basePrompt);
         setPromptDraft(log.promptTemplate || basePrompt);
@@ -376,7 +417,10 @@ export default function AestheticMirrorPage() {
         setImageCount(Math.max(1, Math.min(4, log.count || log.images.length || 2)));
         setResults(
             log.images.length
-                ? log.images.map((image) => ({ id: image.id, status: "success", prompt: log.prompt, dataUrl: image.dataUrl }))
+                ? log.images.map((image, index) => {
+                      const reference = log.references[index];
+                      return { id: image.id, status: "success", prompt: log.prompt, dataUrl: image.dataUrl, referenceId: reference?.id, referenceName: reference?.name, referenceIndex: reference ? index : undefined };
+                  })
                 : [{ id: log.id, status: log.status === "生成中" ? "running" : "failed", prompt: log.prompt, error: log.errors[0] || (log.status === "生成中" ? undefined : "生成失败") }],
         );
         setActiveHistoryLogId(log.id);
@@ -409,7 +453,7 @@ export default function AestheticMirrorPage() {
 
     return (
         <main className="h-full overflow-hidden bg-stone-50 text-stone-950 dark:bg-[#10100f] dark:text-stone-100">
-            <input ref={referenceInputRef} hidden type="file" accept="image/*" onChange={(event) => void handleUpload(event, "reference")} />
+            <input ref={referenceInputRef} hidden type="file" accept="image/*" multiple onChange={(event) => void handleUpload(event, "reference")} />
             <input ref={productInputRef} hidden type="file" accept="image/*" multiple onChange={(event) => void handleUpload(event, "product")} />
 
             <div className="grid h-full grid-cols-1 gap-3 p-3 lg:grid-cols-[390px_minmax(0,1fr)]">
@@ -437,11 +481,10 @@ export default function AestheticMirrorPage() {
                     <div className="thin-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
                         <UploadPanel
                             title="参考设计图"
-                            subtitle="1 张"
+                            subtitle={`${referenceImages.length}/${maxReferenceImages}`}
                             images={referenceImages}
                             emptyText="上传风格参考"
-                            maxImages={1}
-                            singlePreview
+                            maxImages={maxReferenceImages}
                             onUpload={() => referenceInputRef.current?.click()}
                             onDropFiles={(files) => void uploadFiles(files, "reference")}
                             onPreview={(image) => setActiveUploadPreview(image)}
@@ -510,7 +553,8 @@ export default function AestheticMirrorPage() {
                             </div>
                             <div className="grid grid-cols-1 gap-2">
                                 <ControlField label="数量">
-                                    <Select value={imageCount} options={[1, 2, 3, 4].map((value) => ({ label: `${value} 张`, value }))} onChange={setImageCount} />
+                                    <Select disabled={isBatchMode} value={imageCount} options={[1, 2, 3, 4].map((value) => ({ label: `${value} 张`, value }))} onChange={setImageCount} />
+                                    {isBatchMode ? <div className="mt-1 text-xs text-stone-500">批量模式按参考图数量生成：{referenceImages.length} 张</div> : null}
                                 </ControlField>
                             </div>
                         </section>
@@ -518,7 +562,7 @@ export default function AestheticMirrorPage() {
 
                     <div className="shrink-0 border-t border-stone-200 p-4 dark:border-stone-800">
                         <Button type="primary" size="large" block icon={isGenerating ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />} disabled={!canGenerate} onClick={() => void submitGenerate()}>
-                            {isGenerating ? "正在生成" : `生成 ${imageCount} 张详情图`}
+                            {isGenerating ? "正在生成" : `生成 ${effectiveResultCount} 张详情图`}
                         </Button>
                         <div className="mt-2 flex items-center justify-between text-xs text-stone-500">
                             <span>{aspectRatioOptions.find((item) => item.value === aspectRatio)?.hint}</span>
@@ -535,11 +579,11 @@ export default function AestheticMirrorPage() {
                             <div className="flex items-center gap-2">
                                 <h2 className="text-xl font-semibold text-stone-950 dark:text-white">生成结果</h2>
                                 <Tag className="m-0 border-stone-300 bg-white text-stone-700 dark:border-stone-700 dark:bg-stone-900 dark:text-stone-100">
-                                    {successCount}/{results.length || imageCount}
+                                    {successCount}/{results.length || effectiveResultCount}
                                 </Tag>
                                 {isGenerating ? <Tag className="m-0 border-stone-300 bg-stone-950 text-white dark:border-cyan-500/30 dark:bg-cyan-500/10 dark:text-cyan-200">生成中</Tag> : null}
                             </div>
-                            <p className="mt-1 truncate text-xs text-stone-500">第一张作为风格参考，后续图片作为产品素材。</p>
+                            <p className="mt-1 truncate text-xs text-stone-500">参考设计图学习风格，产品素材图保持主体一致。</p>
                         </div>
                         <div className="flex shrink-0 gap-2">
                             <Button icon={<History className="size-4" />} onClick={() => setHistoryOpen(true)}>
@@ -718,7 +762,13 @@ function UploadPanel({
                 <div className={cn("grid grid-cols-3 gap-2 rounded-md", dragging && "outline outline-2 outline-cyan-500/70 outline-offset-2")} {...dropHandlers}>
                     {images.map((image) => (
                         <div key={image.id} className="group relative overflow-hidden rounded-md border border-stone-200 bg-white dark:border-stone-800 dark:bg-black">
-                            <img src={image.dataUrl} alt={image.name} className="aspect-square w-full object-cover" />
+                            {onPreview ? (
+                                <button type="button" className="block w-full cursor-zoom-in" onClick={() => onPreview(image)} aria-label="预览图片">
+                                    <img src={image.dataUrl} alt={image.name} className="aspect-square w-full object-cover" />
+                                </button>
+                            ) : (
+                                <img src={image.dataUrl} alt={image.name} className="aspect-square w-full object-cover" />
+                            )}
                             <button
                                 type="button"
                                 className="absolute right-1 top-1 grid size-7 place-items-center rounded-full border border-white/80 bg-black/80 text-white opacity-0 shadow-[0_3px_10px_rgba(0,0,0,0.45)] backdrop-blur transition hover:border-black/20 hover:bg-white hover:text-stone-950 group-hover:opacity-100"
@@ -797,6 +847,7 @@ function EmptyResult() {
 
 function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenCanvas }: { result: MirrorResult; index: number; aspectRatio: AspectRatio; onPreview: () => void; onDownload: () => void; onOpenCanvas: () => void }) {
     const ratioClass = aspectRatio === "16:9" ? "aspect-video" : aspectRatio === "9:16" ? "aspect-[9/16]" : aspectRatio === "3:4" ? "aspect-[3/4]" : aspectRatio === "4:5" ? "aspect-[4/5]" : "aspect-square";
+    const title = result.referenceIndex !== undefined ? `参考 ${result.referenceIndex + 1} · 详情图方案` : `详情图方案 ${index + 1}`;
     return (
         <article className="overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm dark:border-stone-800 dark:bg-[#11100f] dark:shadow-none">
             <div className={cn("group relative grid place-items-center bg-stone-100 dark:bg-black", ratioClass)}>
@@ -806,7 +857,7 @@ function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenC
                         <span className="text-sm">分析风格并生成中</span>
                     </div>
                 ) : result.status === "success" && result.dataUrl ? (
-                    <Image src={result.dataUrl} alt={`详情图 ${index + 1}`} preview={false} className="h-full w-full object-cover" />
+                    <Image src={result.dataUrl} alt={title} preview={false} className="h-full w-full object-cover" />
                 ) : (
                     <div className="px-6 text-center text-sm text-red-600 dark:text-red-300">{result.error || "生成失败"}</div>
                 )}
@@ -830,7 +881,8 @@ function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenC
             </div>
             <div className="p-3">
                 <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold text-stone-950 dark:text-white">详情图方案 {index + 1}</div>
+                    <div className="truncate text-sm font-semibold text-stone-950 dark:text-white">{title}</div>
+                    {result.referenceName ? <div className="mt-0.5 truncate text-xs text-stone-500">{result.referenceName}</div> : null}
                     <div className="mt-0.5 text-xs text-stone-500">{statusText(result.status)}</div>
                 </div>
             </div>
@@ -1023,7 +1075,7 @@ function normalizeMirrorHistoryLog(log: Partial<MirrorHistoryLog>): MirrorHistor
         aspectRatio,
         imageSize,
         quality: log.quality || "auto",
-        count: Math.max(1, Math.min(4, Number(log.count) || log.images?.length || 2)),
+        count: Math.max(1, Math.min(maxReferenceImages, Number(log.count) || log.images?.length || 2)),
         durationMs: log.durationMs || 0,
         status: log.status === "失败" ? "失败" : log.status === "生成中" ? "生成中" : "成功",
         references: normalizeHistoryReferences(log.references || []),
