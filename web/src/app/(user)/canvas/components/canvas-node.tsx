@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { ChevronRight, Image as ImageIcon, RefreshCw, Star, Video } from "lucide-react";
+import { ChevronRight, Image as ImageIcon, Plus, RefreshCw, Star, Video } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
@@ -21,6 +21,10 @@ const LAYER_TEXT_LINE_HEIGHT = 1.16;
 function isRemoveBackgroundResultNode(node: CanvasNodeData) {
     const prompt = node.metadata?.prompt?.trim() || "";
     return node.type === CanvasNodeType.Image && Boolean(node.metadata?.removeBackground || node.title === "去背景" || REMOVE_BACKGROUND_PROMPT_PREFIXES.some((prefix) => prompt.startsWith(prefix)));
+}
+
+function shouldHidePromptPanel(node: CanvasNodeData) {
+    return Boolean(node.metadata?.hidePromptPanel || isRemoveBackgroundResultNode(node));
 }
 
 function isLayerTextNode(node: CanvasNodeData) {
@@ -61,6 +65,7 @@ type CanvasNodeProps = {
     isConnectionTarget: boolean;
     isConnecting: boolean;
     editRequestNonce?: number;
+    isEditingRequested?: boolean;
     showPanel: boolean;
     showImageInfo: boolean;
     renderPanel?: (node: CanvasNodeData) => ReactNode;
@@ -72,6 +77,7 @@ type CanvasNodeProps = {
     batchRecovering?: boolean;
     batchMotion?: { x: number; y: number; index: number };
     onMouseDown: (event: React.MouseEvent, nodeId: string) => void;
+    onOpenPanel?: (nodeId: string) => void;
     onHoverStart: (nodeId: string) => void;
     onHoverEnd: (nodeId: string) => void;
     onConnectStart: (event: React.MouseEvent, nodeId: string, handleType: "source" | "target") => void;
@@ -113,6 +119,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     isConnectionTarget,
     isConnecting,
     editRequestNonce = 0,
+    isEditingRequested = false,
     showPanel,
     showImageInfo,
     renderPanel,
@@ -124,6 +131,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     batchRecovering = false,
     batchMotion,
     onMouseDown,
+    onOpenPanel,
     onHoverStart,
     onHoverEnd,
     onConnectStart,
@@ -137,6 +145,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     onContextMenu,
 }: CanvasNodeProps) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const promptPanelScale = scale > 0 ? 1 / scale : 1;
     const [hovered, setHovered] = useState(false);
     const [isEditingContent, setIsEditingContent] = useState(false);
     const hasImageContent = data.type === CanvasNodeType.Image && Boolean(data.metadata?.content);
@@ -144,7 +153,7 @@ export const CanvasNode = React.memo(function CanvasNode({
     const isLayerText = isLayerTextNode(data);
     const isBatchRoot = data.type === CanvasNodeType.Image && Boolean(data.metadata?.isBatchRoot) && batchCount > 1;
     const isBatchChild = data.type === CanvasNodeType.Image && Boolean(data.metadata?.batchRootId);
-    const isRemoveBackgroundNode = isRemoveBackgroundResultNode(data);
+    const hidePromptPanel = shouldHidePromptPanel(data);
     const isActive = isConnectionTarget || isSelected || isFocusRelated;
     const imageBorderColor = isActive ? selectionBlue : isRelated && !isBatchChild ? theme.node.muted : "transparent";
     const frameSize = isLayerText ? layerTextFrameSize(data) : { width: data.width, height: data.height };
@@ -186,6 +195,12 @@ export const CanvasNode = React.memo(function CanvasNode({
         if (!editRequestNonce || data.type !== CanvasNodeType.Text) return;
         setIsEditingContent(true);
     }, [data.type, editRequestNonce]);
+
+    useEffect(() => {
+        if (data.type !== CanvasNodeType.Text || isEditingRequested) return;
+        setIsEditingContent(false);
+        textareaRef.current?.blur();
+    }, [data.type, isEditingRequested]);
 
     useEffect(() => {
         if (!isLayerText || resizeRef.current.isResizing) return;
@@ -321,13 +336,18 @@ export const CanvasNode = React.memo(function CanvasNode({
             onContextMenu={(event) => onContextMenu(event, data.id)}
         >
             <div
-                className="relative h-full w-full overflow-visible rounded-3xl border-2"
+                className={`relative h-full w-full overflow-visible border-2 ${hasImageContent || isLayerText ? "rounded-none" : "rounded-3xl"}`}
                 style={{
                     background: hasImageContent || hasVideoContent || isLayerText ? "transparent" : theme.node.fill,
                     borderColor: isLayerText ? (isActive ? selectionBlue : isRelated ? theme.node.muted : "transparent") : hasImageContent ? imageBorderColor : isActive ? selectionBlue : isRelated ? theme.node.muted : theme.node.stroke,
                     boxShadow: isLayerText ? (isActive ? `0 0 0 1px ${selectionBlue}55` : undefined) : isActive ? `0 0 0 1px ${selectionBlue}55` : isRelated && !isBatchChild ? `0 0 0 1px ${theme.node.muted}55, 0 18px 48px rgba(0,0,0,.14)` : undefined,
                 }}
                 onMouseDown={(event) => onMouseDown(event, data.id)}
+                onClick={(event) => {
+                    if (data.type !== CanvasNodeType.Image && data.type !== CanvasNodeType.Video && data.type !== CanvasNodeType.Config) return;
+                    event.stopPropagation();
+                    onOpenPanel?.(data.id);
+                }}
                 onDoubleClick={(event) => {
                     if (isBatchRoot) {
                         event.stopPropagation();
@@ -345,7 +365,7 @@ export const CanvasNode = React.memo(function CanvasNode({
                 }}
             >
                 <div
-                    className={`relative flex h-full w-full items-center justify-center rounded-[inherit] ${isBatchRoot || isLayerText ? "overflow-visible" : "overflow-hidden"}`}
+                    className={`relative flex h-full w-full items-center justify-center ${hasImageContent || isLayerText ? "rounded-none" : "rounded-[inherit]"} ${hasImageContent || isBatchRoot || isLayerText ? "overflow-visible" : "overflow-hidden"}`}
                     style={
                         {
                             "--batch-from-x": `${batchMotion?.x || 0}px`,
@@ -390,7 +410,15 @@ export const CanvasNode = React.memo(function CanvasNode({
             <ConnectionHandleDot side="left" visible={hovered || isSelected || isConnecting} onMouseDown={(event) => onConnectStart(event, data.id, "target")} />
             <ConnectionHandleDot side="right" visible={data.type !== CanvasNodeType.Config && (hovered || isSelected || isConnecting)} onMouseDown={(event) => onConnectStart(event, data.id, "source")} />
 
-            {showPanel && renderPanel && data.type !== CanvasNodeType.Config && !isRemoveBackgroundNode && !isLayerText ? <div className="absolute left-1/2 top-full z-[70] w-[500px] -translate-x-1/2 pt-4">{renderPanel(data)}</div> : null}
+            {showPanel && renderPanel && data.type !== CanvasNodeType.Config && !hidePromptPanel && !isLayerText ? (
+                <div
+                    data-canvas-no-zoom
+                    className="absolute left-1/2 top-full z-[70] w-[560px] pt-4"
+                    style={{ transform: `translateX(-50%) scale(${promptPanelScale})`, transformOrigin: "top center" }}
+                >
+                    {renderPanel(data)}
+                </div>
+            ) : null}
         </div>
     );
 });
@@ -456,6 +484,8 @@ function ErrorContent({ node, theme, onRetry }: Pick<NodeContentRendererProps, "
 
 function TextContent({ node, theme, isEditingContent, textareaRef, onContentChange, onStopEditing, onGenerateImage }: NodeContentRendererProps) {
     if (node.metadata?.layerText) {
+        const strokeWidth = Math.max(0, node.metadata.textStrokeWidth || 0);
+        const strokeColor = node.metadata.textStrokeColor || "transparent";
         const textStyle: React.CSSProperties = {
             fontSize: `${node.metadata.fontSize || 14}px`,
             color: node.metadata.textColor || theme.node.text,
@@ -464,6 +494,8 @@ function TextContent({ node, theme, isEditingContent, textareaRef, onContentChan
             fontStyle: (node.metadata.fontStyle || "normal") as React.CSSProperties["fontStyle"],
             opacity: typeof node.metadata.textOpacity === "number" ? Math.min(1, Math.max(0, node.metadata.textOpacity)) : 1,
             lineHeight: 1.16,
+            WebkitTextStroke: strokeWidth > 0 ? `${strokeWidth}px ${strokeColor}` : undefined,
+            textShadow: strokeWidth > 0 ? `0 0 ${Math.max(1, strokeWidth * 0.45)}px ${strokeColor}` : undefined,
         };
 
         if (isEditingContent) {
@@ -623,7 +655,7 @@ function ImageContent({
 
     return (
         <BatchFrame batchCount={isBatchRoot ? batchCount : 0} batchExpanded={batchExpanded} batchOpening={batchOpening} batchRecovering={batchRecovering} onToggleBatch={onToggleBatch}>
-            <div className="h-full w-full overflow-hidden rounded-3xl">
+            <div className="h-full w-full overflow-visible rounded-none">
                 <img
                     src={node.metadata!.content!}
                     alt={node.title}
@@ -734,15 +766,37 @@ function ResizeHandle({ corner, onMouseDown }: { corner: ResizeCorner; onMouseDo
 
 function ConnectionHandleDot({ side, visible, onMouseDown }: { side: "left" | "right"; visible: boolean; onMouseDown: (event: React.MouseEvent) => void }) {
     const theme = canvasThemes[useThemeStore((state) => state.theme)];
+    const isSourceHandle = side === "right";
+    const hitAreaSize = isSourceHandle ? 68 : 56;
+    const bubbleSize = isSourceHandle ? 36 : 18;
+    const bubbleOffset = hitAreaSize / 2;
 
     return (
         <div
-            className={`absolute top-1/2 z-30 flex size-12 -translate-y-1/2 cursor-crosshair items-center justify-center transition-opacity duration-150 ${
-                side === "left" ? "-left-6" : "-right-6"
-            } ${visible ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"}`}
+            className={`absolute top-1/2 z-30 flex -translate-y-1/2 cursor-crosshair items-center justify-center transition-all duration-150 ${
+                visible ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0"
+            }`}
+            style={{
+                width: hitAreaSize,
+                height: hitAreaSize,
+                left: side === "left" ? -bubbleOffset : undefined,
+                right: side === "right" ? -bubbleOffset : undefined,
+            }}
             onMouseDown={onMouseDown}
         >
-            <div className="size-3 rounded-full border-2 transition-all hover:scale-125" style={{ background: theme.node.panel, borderColor: theme.node.muted }} />
+            <div
+                className="flex items-center justify-center rounded-full transition-transform duration-150 hover:scale-110"
+                style={{
+                    width: bubbleSize,
+                    height: bubbleSize,
+                    background: "rgba(255,255,255,.97)",
+                    border: `1.5px solid ${isSourceHandle ? "rgba(15,23,42,.12)" : theme.node.stroke}`,
+                    boxShadow: isSourceHandle ? "0 12px 28px rgba(15,23,42,.16)" : "0 8px 18px rgba(15,23,42,.10)",
+                    color: "#111827",
+                }}
+            >
+                {isSourceHandle ? <Plus className="size-[18px]" strokeWidth={2.4} /> : <div className="size-[7px] rounded-full" style={{ background: theme.node.faint }} />}
+            </div>
         </div>
     );
 }

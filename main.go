@@ -19,6 +19,7 @@ func main() {
 	service.StartRemoveBackgroundWarmup()
 	service.StartPromptSyncScheduler()
 	service.StartStorageCapacityScheduler()
+	service.StartStorageObjectCleanupScheduler()
 	service.StartAILogCleanupScheduler()
 	log.Fatal(router.New().Run(":" + config.Cfg.Port))
 }

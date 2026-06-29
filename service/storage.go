@@ -14,11 +14,14 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/basketikun/infinite-canvas/config"
 	"github.com/basketikun/infinite-canvas/model"
 	"github.com/basketikun/infinite-canvas/repository"
 	"github.com/google/uuid"
@@ -105,11 +108,20 @@ type StorageCapacityResult struct {
 }
 
 const defaultStorageCapacityLimitBytes int64 = 9 * 1024 * 1024 * 1024
+const localStorageProviderID = "local"
+const localStorageBucket = "local"
+const localStoragePathPrefix = "images"
+const defaultStorageObjectRetentionDays = 15
+const defaultStorageObjectCleanupCron = "0 4 * * *"
 
 var (
 	storageCapacityCron *cron.Cron
 	storageCapacityOnce sync.Once
 	storageCapacityMu   sync.Mutex
+
+	storageObjectCleanupCron *cron.Cron
+	storageObjectCleanupOnce sync.Once
+	storageObjectCleanupMu   sync.Mutex
 )
 
 func PublicStorageConfig() (model.PublicStorageSetting, error) {
@@ -768,7 +780,8 @@ func UploadStorageObjectWithProvider(ctx context.Context, filename string, conte
 	}
 	storage := normalizePrivateStorageSetting(settings.Private.Storage)
 	usingUserProvider := providerInput != nil && storage.AllowUserProvider
-	if !usingUserProvider && storage.Mode != "server_sqlite_s3" && storage.Mode != "hybrid" {
+	usingLocalStorage := !usingUserProvider && storage.Mode == "server_local"
+	if !usingUserProvider && !usingLocalStorage && storage.Mode != "server_sqlite_s3" && storage.Mode != "hybrid" {
 		return UploadedStorageObject{}, errors.New("服务端对象存储未启用")
 	}
 	var provider model.StorageProvider
@@ -777,6 +790,8 @@ func UploadStorageObjectWithProvider(ctx context.Context, filename string, conte
 		if provider.Endpoint == "" || provider.Bucket == "" || provider.AccessKeyID == "" || provider.SecretAccessKey == "" {
 			return UploadedStorageObject{}, errors.New("用户对象存储配置不完整")
 		}
+	} else if usingLocalStorage {
+		provider = localStorageProvider()
 	} else {
 		provider, err = selectStorageProvider(storage)
 		if err != nil {
@@ -795,15 +810,25 @@ func UploadStorageObjectWithProvider(ctx context.Context, filename string, conte
 	nowTime := time.Now()
 	objectKey := strings.Trim(strings.Trim(provider.PathPrefix, "/")+"/"+userID+"/"+nowTime.Format("2006/01/02")+"/"+objectID+ext, "/")
 	sum := sha256.Sum256(data)
-	if err := putS3Object(provider, objectKey, contentType, data); err != nil {
-		return UploadedStorageObject{}, err
+	publicURL := ""
+	if usingLocalStorage {
+		if err := putLocalStorageObject(objectKey, data); err != nil {
+			return UploadedStorageObject{}, err
+		}
+	} else {
+		if err := putS3Object(provider, objectKey, contentType, data); err != nil {
+			return UploadedStorageObject{}, err
+		}
+		publicURL = objectURL(provider, objectKey)
 	}
-	publicURL := objectURL(provider, objectKey)
 	object := model.StorageObject{
 		ID: objectID, ProviderID: provider.ID, Bucket: provider.Bucket, ObjectKey: objectKey, PublicURL: publicURL,
 		MimeType: contentType, Bytes: int64(len(data)), SHA256: hex.EncodeToString(sum[:]), CreatedBy: userID, CreatedAt: now(),
 	}
 	if _, err := repository.SaveStorageObject(object); err != nil {
+		if usingLocalStorage {
+			_ = deleteLocalStorageObject(objectKey)
+		}
 		return UploadedStorageObject{}, err
 	}
 	url := "/api/files/" + objectID + "/content"
@@ -823,6 +848,12 @@ func DeleteStorageObject(ctx context.Context, id string, providerInput *StorageO
 	}
 	if user, ok := UserFromContext(ctx); ok && object.CreatedBy != "" && object.CreatedBy != user.ID {
 		return errors.New("无权删除该对象")
+	}
+	if isLocalStorageObject(object) {
+		if err := deleteLocalStorageObject(object.ObjectKey); err != nil {
+			return err
+		}
+		return repository.DeleteStorageObjectRecord(id)
 	}
 	settings, err := repository.GetSettings()
 	if err != nil {
@@ -959,10 +990,75 @@ func RefreshStorageCapacityScheduler() {
 	}
 }
 
+func StartStorageObjectCleanupScheduler() {
+	storageObjectCleanupOnce.Do(func() {
+		storageObjectCleanupCron = cron.New()
+		storageObjectCleanupCron.Start()
+	})
+	storageObjectCleanupMu.Lock()
+	defer storageObjectCleanupMu.Unlock()
+	if storageObjectCleanupCron == nil {
+		return
+	}
+	for _, entry := range storageObjectCleanupCron.Entries() {
+		storageObjectCleanupCron.Remove(entry.ID)
+	}
+	if _, err := storageObjectCleanupCron.AddFunc(defaultStorageObjectCleanupCron, func() {
+		removed, err := CleanupExpiredStorageObjects(defaultStorageObjectRetentionDays)
+		if err != nil {
+			log.Printf("storage object cleanup failed err=%v", err)
+			return
+		}
+		log.Printf("storage object cleanup done removed=%d retentionDays=%d", removed, defaultStorageObjectRetentionDays)
+	}); err != nil {
+		log.Printf("add storage object cleanup cron failed cron=%s err=%v", defaultStorageObjectCleanupCron, err)
+	}
+}
+
+func CleanupExpiredStorageObjects(retentionDays int) (int, error) {
+	if retentionDays <= 0 {
+		retentionDays = defaultStorageObjectRetentionDays
+	}
+	cutoff := time.Now().AddDate(0, 0, -retentionDays).Format(time.RFC3339)
+	removed := 0
+	for {
+		objects, err := repository.ListStorageObjectsByProviderBefore(localStorageProviderID, cutoff, 200)
+		if err != nil {
+			return removed, err
+		}
+		if len(objects) == 0 {
+			return removed, nil
+		}
+		deletedInBatch := 0
+		for _, object := range objects {
+			if err := deleteLocalStorageObject(object.ObjectKey); err != nil {
+				log.Printf("delete expired local storage object failed id=%s err=%v", object.ID, err)
+				continue
+			}
+			if err := repository.DeleteStorageObjectRecord(object.ID); err != nil {
+				log.Printf("delete expired local storage record failed id=%s err=%v", object.ID, err)
+				continue
+			}
+			removed++
+			deletedInBatch++
+		}
+		if deletedInBatch == 0 {
+			return removed, nil
+		}
+	}
+}
+
 func DownloadStorageObject(id string) (DownloadedStorageObject, error) {
 	object, err := repository.GetStorageObject(id)
 	if err != nil {
 		return DownloadedStorageObject{}, err
+	}
+	if isLocalStorageObject(object) {
+		data, err := getLocalStorageObject(object.ObjectKey)
+		if err != nil {
+			return DownloadedStorageObject{}, err
+		}
+		return DownloadedStorageObject{Object: object, Data: data}, nil
 	}
 
 	var provider model.StorageProvider
@@ -1030,6 +1126,82 @@ func DownloadStorageObject(id string) (DownloadedStorageObject, error) {
 	return DownloadedStorageObject{}, errors.New("无法读取对象存储文件")
 }
 
+func localStorageProvider() model.StorageProvider {
+	return model.StorageProvider{
+		ID:         localStorageProviderID,
+		Name:       "Server Local",
+		Type:       "local",
+		Bucket:     localStorageBucket,
+		PathPrefix: localStoragePathPrefix,
+		Weight:     1,
+		Enabled:    true,
+	}
+}
+
+func isLocalStorageObject(object model.StorageObject) bool {
+	return object.ProviderID == localStorageProviderID || (object.ProviderID == "" && object.Bucket == localStorageBucket)
+}
+
+func localStorageRoot() string {
+	if dir := strings.TrimSpace(config.Cfg.FileStorageDir); dir != "" {
+		return dir
+	}
+	baseDir := "data"
+	if dsn := strings.TrimSpace(config.Cfg.DatabaseDSN); dsn != "" && dsn != ":memory:" {
+		baseDir = filepath.Dir(dsn)
+	}
+	return filepath.Join(baseDir, "files")
+}
+
+func localStoragePath(objectKey string) (string, error) {
+	cleanKey := filepath.Clean(filepath.FromSlash(strings.TrimLeft(objectKey, "/")))
+	if cleanKey == "." || strings.HasPrefix(cleanKey, ".."+string(filepath.Separator)) || cleanKey == ".." || filepath.IsAbs(cleanKey) {
+		return "", errors.New("文件路径不合法")
+	}
+	root, err := filepath.Abs(localStorageRoot())
+	if err != nil {
+		return "", err
+	}
+	target, err := filepath.Abs(filepath.Join(root, cleanKey))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || rel == ".." || filepath.IsAbs(rel) {
+		return "", errors.New("文件路径不合法")
+	}
+	return target, nil
+}
+
+func putLocalStorageObject(objectKey string, data []byte) error {
+	filePath, err := localStoragePath(objectKey)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(filePath, data, 0644)
+}
+
+func getLocalStorageObject(objectKey string) ([]byte, error) {
+	filePath, err := localStoragePath(objectKey)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filePath)
+}
+
+func deleteLocalStorageObject(objectKey string) error {
+	filePath, err := localStoragePath(objectKey)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
 
 func selectStorageProvider(storage model.PrivateStorageSetting) (model.StorageProvider, error) {
 	var candidates []model.StorageProvider

@@ -15,6 +15,7 @@ import {
     FolderPlus,
     History,
     ImagePlus,
+    Link2,
     LoaderCircle,
     PanelBottom,
     PanelLeft,
@@ -27,26 +28,20 @@ import {
     Upload,
     WandSparkles,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Image, Input, Mentions, Modal, Tag, Typography } from "antd";
 import localforage from "localforage";
 import { saveAs } from "file-saver";
 import { cn } from "@/lib/utils";
 import { createZip } from "@/lib/zip";
 
-import { ImageSettingsPanel, imageFormatLabel, imageQualityLabel, imageSizeLabel } from "@/components/image-settings-panel";
+import { ImageSettingsPanel, imageAspectValue, imageFormatLabel, imageResolutionLabel, imageResolutionValue, imageSizeLabel, resolveImageSizeForResolution } from "@/components/image-settings-panel";
 import { ModelPicker } from "@/components/model-picker";
 import { PromptSelectDialog } from "@/components/prompts/prompt-select-dialog";
 import { AssetPickerModal, type InsertAssetPayload } from "@/app/(user)/canvas/components/asset-picker-modal";
 import { canvasThemes } from "@/lib/canvas-theme";
 import { promptLibraryEnabled } from "@/constant/feature-flags";
-import {
-    CreativeWorkflowWorkspace,
-    type WorkflowExternalTaskFailure,
-    type WorkflowRunnerRequest,
-    type WorkflowExternalTaskStart,
-    type WorkflowExternalTaskSuccess,
-} from "@/components/workflows/creative-workflow-workspace";
+import { CreativeWorkflowWorkspace, type WorkflowExternalTaskFailure, type WorkflowRunnerRequest, type WorkflowExternalTaskStart, type WorkflowExternalTaskSuccess } from "@/components/workflows/creative-workflow-workspace";
 import { useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
@@ -55,15 +50,19 @@ import { ImageRequestError, requestEdit, requestGeneration } from "@/services/ap
 import { currentImageHistoryScope, isHistoryLogKeyInScope, scopedImageHistoryCategoryKey, scopedImageHistoryLogKey } from "@/services/image-history-storage";
 import { fetchUserConfig, syncUserImageHistory } from "@/services/api/user-config";
 import { collectImageStorageKeys, deleteStoredImages, imageToDataUrl, resolveImageUrl, setImageBlob, uploadImage } from "@/services/image-storage";
+import { ensureImageShareLink, type ImageShareLinkResult } from "@/services/image-share-link";
 import { useCanvasStore } from "@/app/(user)/canvas/stores/use-canvas-store";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
+import { useCopyText } from "@/hooks/use-copy-text";
 
 type GeneratedImage = {
     id: string;
     dataUrl: string;
     storageKey?: string;
+    shareId?: string;
+    shareUrl?: string;
     durationMs: number;
     width: number;
     height: number;
@@ -89,6 +88,10 @@ type GenerationResult = {
     workflowName?: string;
     workflowInputs?: Record<string, unknown>;
     workflowTaskId?: string;
+    versionGroupId?: string;
+    versionNo?: number;
+    retryOfLogId?: string;
+    retryOfVersionNo?: number;
 };
 
 type GenerationLog = {
@@ -116,19 +119,24 @@ type GenerationLog = {
     workflowName?: string;
     workflowInputs?: Record<string, unknown>;
     workflowSeriesRunId?: string;
+    versionGroupId?: string;
+    versionNo?: number;
+    retryOfLogId?: string;
+    retryOfVersionNo?: number;
 };
 
 type GenerationLogConfig = Pick<AiConfig, "model" | "imageModel" | "quality" | "size" | "count" | "apiMode" | "outputFormat" | "outputCompression" | "moderation" | "timeout" | "streamImages" | "streamPartialImages" | "responseFormatB64Json" | "codexCli">;
 type RequestSnapshot = { text: string; requestText: string; requestConfig: AiConfig; displayConfig: GenerationLogConfig; references: ReferenceImage[] };
 type GenerationCategory = { id: string; name: string; createdAt: number };
 type ResultViewMode = "all" | "category";
-type ProductPackageGroup = "main" | "sub" | "detail";
+type ProductPackageGroup = "main" | "sub" | "detail" | "sku" | "other";
 type ProductPackageItemStatus = "waiting" | "running" | "success" | "failed";
 
 type ProductPackageItem = {
     id: string;
     logId?: string;
     taskId?: string;
+    selected?: boolean;
     group: ProductPackageGroup;
     index: number;
     groupIndex: number;
@@ -144,6 +152,22 @@ type ProductPackageItem = {
     startedAt?: number;
     endedAt?: number;
     durationMs?: number;
+    sourceFolderName?: string;
+    sourceFileName?: string;
+};
+
+type ParsedFolderPackageItem = {
+    file: File;
+    group: ProductPackageGroup;
+    folderName: string;
+    fileName: string;
+};
+
+type ParsedFolderPackage = {
+    rootName: string;
+    transparentFile: File;
+    items: ParsedFolderPackageItem[];
+    skippedCount: number;
 };
 
 type ProductImagePackage = {
@@ -164,6 +188,15 @@ type ProductImagePackage = {
 
 type SubmitGenerationOptions = {
     replaceLog?: GenerationLog | null;
+    anchorLog?: GenerationLog | null;
+    retrySourceLog?: GenerationLog | null;
+    batchMode?: boolean;
+    onAccepted?: () => void;
+};
+
+type GenerationTaskEntry = {
+    id: string;
+    snapshot: RequestSnapshot;
 };
 
 type PackageQuickStartDraft = {
@@ -183,11 +216,17 @@ type CollapsedSections = Record<CollapsibleSectionKey, boolean>;
 
 const LOG_STORE_KEY = "infinite-canvas:image_generation_logs";
 const CATEGORY_STORE_KEY = "infinite-canvas:image_generation_categories";
+const PACKAGE_STORE_KEY = "infinite-canvas:image_product_packages";
 const WORKBENCH_LAYOUT_KEY = "infinite-canvas:image-workbench-layout";
+const WORKBENCH_BOTTOM_COLLAPSED_KEY = "infinite-canvas:image-workbench-bottom-collapsed";
 const RESULT_VIEW_MODE_KEY = "infinite-canvas:image-result-view-mode";
 const WORKFLOW_BUTTON_POSITION_KEY = "infinite-canvas:workflow-button-position";
+const BATCH_GENERATION_CONFIRM_THRESHOLD = 30;
+const folderPackageWorkflowId = "folder-reference-package";
+const packageGroupOrder: ProductPackageGroup[] = ["main", "sku", "detail", "sub", "other"];
 const logStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_logs" });
 const categoryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_generation_categories" });
+const packageStore = localforage.createInstance({ name: "infinite-canvas", storeName: "image_product_packages" });
 const defaultCollapsedSections: CollapsedSections = { prompt: false, references: true, settings: true };
 const demoProductWorkflowId = "demo-product-package";
 const defaultPackageQuickStartDraft: PackageQuickStartDraft = {
@@ -202,7 +241,9 @@ const defaultPackageQuickStartDraft: PackageQuickStartDraft = {
 
 export default function ImagePage() {
     const { message, modal } = App.useApp();
+    const copyText = useCopyText();
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const folderInputRef = useRef<HTMLInputElement>(null);
     const config = useConfigStore((state) => state.config);
     const effectiveConfig = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
@@ -220,7 +261,9 @@ export default function ImagePage() {
     const [categories, setCategories] = useState<GenerationCategory[]>([]);
     const [resultViewMode, setResultViewModeState] = useState<ResultViewMode>("all");
     const [activeResultCategoryId, setActiveResultCategoryId] = useState<string | null>(null);
+    const [batchMode, setBatchMode] = useState(false);
     const [workbenchLayout, setWorkbenchLayoutState] = useState<WorkbenchLayout>("side");
+    const [workbenchBottomCollapsed, setWorkbenchBottomCollapsedState] = useState(false);
     const [collapsedSections, setCollapsedSections] = useState<CollapsedSections>(defaultCollapsedSections);
     const [promptDialogOpen, setPromptDialogOpen] = useState(false);
     const [assetPickerOpen, setAssetPickerOpen] = useState(false);
@@ -229,8 +272,10 @@ export default function ImagePage() {
     const [workflowRunnerRequest, setWorkflowRunnerRequest] = useState<WorkflowRunnerRequest | null>(null);
     const [selectedLogIds, setSelectedLogIds] = useState<string[]>([]);
     const [selectedPackageIds, setSelectedPackageIds] = useState<string[]>([]);
+    const [selectedResultIds, setSelectedResultIds] = useState<string[]>([]);
     const [previewLog, setPreviewLog] = useState<GenerationLog | null>(null);
     const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+    const [linkingImageId, setLinkingImageId] = useState("");
     const [now, setNow] = useState(Date.now());
     const [workflowButtonPosition, setWorkflowButtonPosition] = useState({ x: 0, y: 0 });
     const [packageQuickStartDraft, setPackageQuickStartDraft] = useState<PackageQuickStartDraft>(defaultPackageQuickStartDraft);
@@ -238,6 +283,7 @@ export default function ImagePage() {
     const workflowButtonDragRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number; moved: boolean } | null>(null);
     const packageTaskMapRef = useRef<Record<string, string>>({});
     const accountHistorySyncEnabledRef = useRef(false);
+    const productPackagesLoadedRef = useRef(false);
 
     const model = effectiveConfig.imageModel || effectiveConfig.model;
     const canGenerate = Boolean(prompt.trim());
@@ -250,9 +296,11 @@ export default function ImagePage() {
     useEffect(() => {
         void refreshLogs();
         void refreshCategories();
+        void refreshProductPackages();
         try {
             const storedLayout = window.localStorage?.getItem(WORKBENCH_LAYOUT_KEY);
             if (storedLayout === "side" || storedLayout === "bottom") setWorkbenchLayoutState(storedLayout);
+            setWorkbenchBottomCollapsedState(window.localStorage?.getItem(WORKBENCH_BOTTOM_COLLAPSED_KEY) === "true");
             const storedViewMode = window.localStorage?.getItem(RESULT_VIEW_MODE_KEY);
             if (storedViewMode === "all" || storedViewMode === "category") setResultViewModeState(storedViewMode);
             const storedButtonPosition = JSON.parse(window.localStorage?.getItem(WORKFLOW_BUTTON_POSITION_KEY) || "null") as { x?: number; y?: number } | null;
@@ -270,10 +318,25 @@ export default function ImagePage() {
     }, [isUserReady, token]);
 
     useEffect(() => {
+        if (!productPackagesLoadedRef.current) return;
+        void replaceStoredProductPackages(productPackages);
+    }, [productPackages]);
+
+    useEffect(() => {
         if (!pendingCount) return;
         const timer = window.setInterval(() => setNow(Date.now()), 1000);
         return () => window.clearInterval(timer);
     }, [pendingCount]);
+
+    useEffect(() => {
+        const resultIds = new Set(results.map((item) => item.id));
+        setSelectedResultIds((ids) => (ids.every((id) => resultIds.has(id)) ? ids : ids.filter((id) => resultIds.has(id))));
+    }, [results]);
+
+    useEffect(() => {
+        folderInputRef.current?.setAttribute("webkitdirectory", "");
+        folderInputRef.current?.setAttribute("directory", "");
+    }, []);
 
     const setWorkbenchLayout = (layout: WorkbenchLayout) => {
         setWorkbenchLayoutState(layout);
@@ -281,6 +344,15 @@ export default function ImagePage() {
             window.localStorage?.setItem(WORKBENCH_LAYOUT_KEY, layout);
         } catch {
             // Keep the in-memory layout even when persistence is unavailable.
+        }
+    };
+
+    const setWorkbenchBottomCollapsed = (collapsed: boolean) => {
+        setWorkbenchBottomCollapsedState(collapsed);
+        try {
+            window.localStorage?.setItem(WORKBENCH_BOTTOM_COLLAPSED_KEY, String(collapsed));
+        } catch {
+            // Keep the collapsed state in memory if persistence is blocked.
         }
     };
 
@@ -383,6 +455,275 @@ export default function ImagePage() {
         }
     };
 
+    const confirmFolderPackageImport = (parsed: ParsedFolderPackage) => {
+        const counts = folderPackageGroupCounts(parsed.items);
+        return new Promise<boolean>((resolve) => {
+            modal.confirm({
+                title: "导入套图文件夹",
+                width: 640,
+                content: (
+                    <div className="space-y-3 text-sm">
+                        <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 dark:border-stone-800 dark:bg-stone-900">
+                            <div className="font-medium">透明图</div>
+                            <div className="mt-1 text-stone-500 dark:text-stone-400">{parsed.transparentFile.name}</div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                            {packageGroupOrder.map((group) =>
+                                counts[group] ? (
+                                    <div key={group} className="rounded-lg border border-stone-200 px-3 py-2 dark:border-stone-800">
+                                        <div className="font-medium">{packageGroupTitle(group)}</div>
+                                        <div className="text-stone-500 dark:text-stone-400">{counts[group]} 张</div>
+                                    </div>
+                                ) : null,
+                            )}
+                        </div>
+                        <div className="text-stone-500 dark:text-stone-400">
+                            将创建「{parsed.rootName}-套图生成」，共 {parsed.items.length} 个任务，默认每张参考图生成 1 张，并一次性全部发起。
+                            {parsed.skippedCount ? ` 已跳过 ${parsed.skippedCount} 个非图片或根目录外文件。` : ""}
+                        </div>
+                    </div>
+                ),
+                okText: "创建并生成",
+                cancelText: "取消",
+                onOk: () => resolve(true),
+                onCancel: () => resolve(false),
+            });
+        });
+    };
+
+    const importPackageFolder = async (files?: FileList | null) => {
+        const promptText = prompt.trim();
+        let parsed: ParsedFolderPackage;
+        try {
+            parsed = parseFolderPackageFiles(Array.from(files || []));
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "文件夹读取失败");
+            return;
+        }
+
+        const hideLoading = message.loading("正在上传套图参考...", 0);
+        try {
+            const modelName = effectiveConfig.imageModel || effectiveConfig.model || model || "gpt-image-2";
+            const requestBaseConfig: AiConfig = { ...effectiveConfig, model: modelName, imageModel: modelName, activeChannelId: effectiveConfig.imageChannelId, count: "1" };
+            const transparentReference = await uploadReferenceFile(parsed.transparentFile);
+            const itemReferences = await Promise.all(parsed.items.map((item) => uploadReferenceFile(item.file, item.folderName)));
+            const groupIndexByGroup = new Map<ProductPackageGroup, number>();
+            const packageId = `folder:${nanoid()}`;
+            const configSnapshot = buildGenerationLogConfig({ ...requestBaseConfig, count: String(parsed.items.length) });
+            const items = await Promise.all(
+                parsed.items.map(async (item, index) => {
+                    const groupIndex = (groupIndexByGroup.get(item.group) || 0) + 1;
+                    groupIndexByGroup.set(item.group, groupIndex);
+                    const itemReference = itemReferences[index];
+                    const itemSize = (await resolveReferenceOutputSize(itemReference, requestBaseConfig.size)) || requestBaseConfig.size;
+                    const itemConfig = buildGenerationLogConfig({ ...requestBaseConfig, size: itemSize, count: "1" });
+                    return {
+                        id: `${packageId}:${index + 1}`,
+                        group: item.group,
+                        index: index + 1,
+                        groupIndex,
+                        title: `${packageGroupTitle(item.group)}-${String(groupIndex).padStart(2, "0")}`,
+                        prompt: promptText,
+                        model: modelName,
+                        config: itemConfig,
+                        references: [transparentReference, itemReference],
+                        status: "waiting" as const,
+                        selected: false,
+                        sourceFolderName: item.folderName,
+                        sourceFileName: item.fileName,
+                    };
+                }),
+            );
+            const nextPackage: ProductImagePackage = {
+                id: packageId,
+                workflowId: folderPackageWorkflowId,
+                workflowName: "文件夹套图生成",
+                packageName: `${parsed.rootName}-套图生成`,
+                productName: parsed.rootName,
+                inputs: { productName: parsed.rootName, prompt: promptText, transparentFile: parsed.transparentFile.name },
+                references: [transparentReference],
+                model: modelName,
+                config: configSnapshot,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                totalCount: items.length,
+                items,
+            };
+            setReferences([transparentReference]);
+            setProductPackages((value) => [nextPackage, ...value.filter((item) => item.id !== nextPackage.id)]);
+            setActivePackageId(packageId);
+            setResultViewMode("all");
+            setActiveResultCategoryId(null);
+            message.success(`已创建 ${items.length} 个待生成任务，勾选后点击开始生成`);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "导入套图文件夹失败");
+        } finally {
+            hideLoading();
+        }
+    };
+
+    const runFolderPackageTasks = async (packageData: ProductImagePackage, requestBaseConfig: AiConfig, itemIds?: string[]) => {
+        const targetIds = itemIds ? new Set(itemIds) : null;
+        const runnableItems = packageData.items.filter((item) => (!targetIds || targetIds.has(item.id)) && item.status !== "running" && item.prompt.trim());
+        await Promise.all(runnableItems.map((item) => runFolderPackageItem(packageData, item, requestBaseConfig)));
+    };
+
+    const runFolderPackageItem = async (packageData: ProductImagePackage, item: ProductPackageItem, requestBaseConfig: AiConfig) => {
+        const startedAt = Date.now();
+        const taskStartedAt = performance.now();
+        const existingLog = findPackageLogForRetry(logs, packageData.id, item);
+        const historyLogs = packageItemHistoryLogs(logs, packageData.id, item.index);
+        const versionMeta = existingLog
+            ? buildPackageItemRetryVersionMeta(packageData.id, item.index, existingLog, historyLogs)
+            : {
+                  versionGroupId: packageItemVersionGroupId(packageData.id, item.index),
+                  nextVersionNo: 1,
+                  retryOfLogId: undefined,
+                  retryOfVersionNo: undefined,
+              };
+        setProductPackages((value) => upsertRetriedPackage(value, packageData, item.id, { status: "running", selected: false, startedAt, endedAt: undefined, durationMs: undefined, error: undefined, errorDetail: undefined, image: undefined }));
+        setNow(startedAt);
+        try {
+            const requestConfig = packageItemRequestConfig(requestBaseConfig, packageData.model, item.config);
+            const result = await requestEdit(requestConfig, item.prompt, item.references);
+            const image = result[0];
+            if (!image) throw new Error("接口没有返回图片");
+            const meta = await readImageMeta(image.dataUrl);
+            const stored = await uploadImage(image.dataUrl);
+            const endedAt = Date.now();
+            const nextImage: GeneratedImage = {
+                id: image.id,
+                dataUrl: stored.url,
+                storageKey: stored.storageKey,
+                durationMs: performance.now() - taskStartedAt,
+                width: stored.width || meta.width,
+                height: stored.height || meta.height,
+                bytes: stored.bytes || getDataUrlByteSize(image.dataUrl),
+                mimeType: stored.mimeType || meta.mimeType,
+            };
+            const log = buildPackageRetryLog({
+                baseLog: existingLog,
+                logId: nanoid(),
+                packageData,
+                item,
+                prompt: item.prompt,
+                model: packageData.model,
+                config: item.config,
+                references: item.references,
+                images: [nextImage],
+                durationMs: endedAt - startedAt,
+                errors: [],
+                errorDetails: [],
+                status: "成功",
+                versionGroupId: versionMeta.versionGroupId,
+                versionNo: versionMeta.nextVersionNo,
+                retryOfLogId: versionMeta.retryOfLogId,
+                retryOfVersionNo: versionMeta.retryOfVersionNo,
+            });
+            setProductPackages((value) =>
+                upsertRetriedPackage(value, packageData, item.id, { status: "success", selected: false, startedAt, endedAt, durationMs: endedAt - startedAt, error: undefined, errorDetail: undefined, image: nextImage, logId: log.id }),
+            );
+            await saveLog(log);
+        } catch (error) {
+            const endedAt = Date.now();
+            const nextError = errorMessage(error);
+            const nextErrorDetail = errorDetail(error);
+            const log = buildPackageRetryLog({
+                baseLog: existingLog,
+                logId: nanoid(),
+                packageData,
+                item,
+                prompt: item.prompt,
+                model: packageData.model,
+                config: item.config,
+                references: item.references,
+                images: [],
+                durationMs: endedAt - startedAt,
+                errors: [nextError],
+                errorDetails: [nextErrorDetail],
+                status: "失败",
+                versionGroupId: versionMeta.versionGroupId,
+                versionNo: versionMeta.nextVersionNo,
+                retryOfLogId: versionMeta.retryOfLogId,
+                retryOfVersionNo: versionMeta.retryOfVersionNo,
+            });
+            setProductPackages((value) =>
+                upsertRetriedPackage(value, packageData, item.id, { status: "failed", selected: false, startedAt, endedAt, durationMs: endedAt - startedAt, error: nextError, errorDetail: nextErrorDetail, image: undefined, logId: log.id }),
+            );
+            await saveLog(log);
+        }
+    };
+
+    const updateProductPackageItems = (packageId: string, updater: (item: ProductPackageItem) => ProductPackageItem) => {
+        const sourcePackage = productPackageFolders.find((item) => item.id === packageId);
+        if (!sourcePackage) return;
+        setProductPackages((value) => {
+            const existing = value.find((item) => item.id === packageId);
+            const base = existing || sourcePackage;
+            const nextPackage = { ...base, updatedAt: Date.now(), items: base.items.map(updater) };
+            return existing ? value.map((item) => (item.id === packageId ? nextPackage : item)) : [nextPackage, ...value];
+        });
+    };
+
+    const togglePackageItemSelected = (packageId: string, itemId: string, checked: boolean) => {
+        updateProductPackageItems(packageId, (item) => (item.id === itemId ? { ...item, selected: checked } : item));
+    };
+
+    const selectPackageItems = (packageId: string, group: ProductPackageGroup | "all", checked: boolean) => {
+        updateProductPackageItems(packageId, (item) => {
+            if (group !== "all" && item.group !== group) return item;
+            if (item.status === "running") return item;
+            return { ...item, selected: checked };
+        });
+    };
+
+    const startSelectedPackageItems = async (packageId: string, group: ProductPackageGroup | "all" = "all", promptOverride?: string) => {
+        const targetPackage = productPackageFolders.find((item) => item.id === packageId);
+        if (!targetPackage) {
+            message.error("没有找到这个套图文件夹");
+            return;
+        }
+        const bulkPrompt = promptOverride?.trim() || "";
+        const shouldApplyBulkPrompt = (item: ProductPackageItem) => item.selected && (group === "all" || item.group === group) && item.status !== "running";
+        const runPackage = bulkPrompt
+            ? {
+                  ...targetPackage,
+                  updatedAt: Date.now(),
+                  items: targetPackage.items.map((item) => (shouldApplyBulkPrompt(item) ? { ...item, prompt: bulkPrompt } : item)),
+              }
+            : targetPackage;
+        if (bulkPrompt) {
+            setProductPackages((value) => value.map((item) => (item.id === packageId ? runPackage : item)));
+        }
+        const selectedItems = runPackage.items.filter((item) => item.selected && (group === "all" || item.group === group));
+        if (!selectedItems.length) {
+            message.warning(group === "all" ? "请先勾选要生成的图片" : `请先勾选${packageGroupTitle(group)}里要生成的图片`);
+            return;
+        }
+        const runnableItems = selectedItems.filter((item) => item.status !== "running");
+        const missingPrompt = runnableItems.filter((item) => !item.prompt.trim());
+        if (missingPrompt.length) {
+            message.error(`有 ${missingPrompt.length} 张没有提示词，请先补充提示词`);
+            return;
+        }
+        const modelName = targetPackage.model || effectiveConfig.imageModel || effectiveConfig.model || model || "gpt-image-2";
+        const requestBaseConfig: AiConfig = { ...effectiveConfig, model: modelName, imageModel: modelName, activeChannelId: effectiveConfig.imageChannelId, count: "1" };
+        if (!isAiConfigReady(requestBaseConfig, modelName)) {
+            message.warning("请先完成配置");
+            openConfigDialog(true);
+            return;
+        }
+        setActivePackageId(packageId);
+        setResultViewMode("all");
+        setActiveResultCategoryId(null);
+        message.success(`${bulkPrompt ? "已套用批量提示词，" : ""}已开始生成 ${runnableItems.length} 张`);
+        await runFolderPackageTasks(
+            clonePackageForRetry(runPackage),
+            requestBaseConfig,
+            runnableItems.map((item) => item.id),
+        );
+    };
+
     const removeReference = async (id: string) => {
         const reference = references.find((item) => item.id === id);
         setReferences((value) => value.filter((ref) => ref.id !== id));
@@ -422,49 +763,87 @@ export default function ImagePage() {
     const generate = async () => {
         const snapshot = buildRequestSnapshot();
         if (!snapshot) return;
-        setPrompt("");
-        setReferences([]);
-        setCollapsedSections((value) => ({ ...value, prompt: false, references: true }));
-        await submitGenerationBatch(snapshot);
+        await submitGenerationBatch(snapshot, {
+            batchMode,
+            onAccepted: () => {
+                setPrompt("");
+                setReferences([]);
+                setCollapsedSections((value) => ({ ...value, prompt: false, references: true }));
+            },
+        });
     };
 
     const retryLog = async (log: GenerationLog) => {
         const taskCount = Math.max(1, Number(log.config.count) || log.imageCount || 1);
         const snapshot = buildRequestSnapshot({ promptText: log.prompt, referenceItems: log.references, taskCount });
         if (!snapshot) return;
-        await submitGenerationBatch(snapshot, { replaceLog: taskCount === 1 ? log : null });
+        await submitGenerationBatch(snapshot, { anchorLog: taskCount === 1 ? log : null, retrySourceLog: log });
     };
 
     const submitGenerationBatch = async (snapshot: RequestSnapshot, options?: SubmitGenerationOptions) => {
         setPreviewLog(null);
         const taskCount = Math.max(1, Number(snapshot.displayConfig.count) || 1);
-        const taskIds = Array.from({ length: taskCount }, () => nanoid());
-        const replaceLog = taskCount === 1 ? options?.replaceLog || null : null;
-        const batchCategoryIds = replaceLog?.categoryIds?.length ? replaceLog.categoryIds : activeResultCategoryId ? [activeResultCategoryId] : [];
-        const queuedTasks = taskIds.map((id, index) =>
-            createPendingResult(id, snapshot, index === 0 ? "running" : "waiting", {
-                logId: replaceLog?.id,
-                createdAt: replaceLog?.createdAt,
-                startedAt: index === 0 ? Date.now() : undefined,
+        const shouldSplitReferences = Boolean(options?.batchMode && snapshot.references.length > 1);
+        const referenceSnapshots = shouldSplitReferences ? await Promise.all(snapshot.references.map((reference) => buildReferenceScopedSnapshot(snapshot, reference))) : [];
+        const taskEntries: GenerationTaskEntry[] = shouldSplitReferences
+            ? referenceSnapshots.flatMap((taskSnapshot) =>
+                  Array.from({ length: taskCount }, () => ({
+                      id: nanoid(),
+                      snapshot: taskSnapshot,
+                  })),
+              )
+            : Array.from({ length: taskCount }, () => ({ id: nanoid(), snapshot }));
+        const totalTaskCount = taskEntries.length;
+        if (shouldSplitReferences && totalTaskCount > BATCH_GENERATION_CONFIRM_THRESHOLD) {
+            const confirmed = await new Promise<boolean>((resolve) => {
+                modal.confirm({
+                    title: "确认批量生成",
+                    content: `批量模式会把 ${snapshot.references.length} 张参考图拆成独立任务，每张生成 ${taskCount} 张，共 ${totalTaskCount} 张。是否继续？`,
+                    okText: "继续生成",
+                    cancelText: "取消",
+                    onOk: () => resolve(true),
+                    onCancel: () => resolve(false),
+                });
+            });
+            if (!confirmed) return;
+        }
+        options?.onAccepted?.();
+        const replaceLog = totalTaskCount === 1 ? options?.replaceLog || null : null;
+        const anchorLog = totalTaskCount === 1 ? options?.anchorLog || replaceLog : null;
+        const retrySourceLog = options?.retrySourceLog || null;
+        const retryVersionMeta = retrySourceLog ? buildRetryVersionMeta(retrySourceLog, logs) : null;
+        const batchCategoryIds = replaceLog?.categoryIds?.length ? replaceLog.categoryIds : retrySourceLog?.categoryIds?.length ? retrySourceLog.categoryIds : activeResultCategoryId ? [activeResultCategoryId] : [];
+        const batchStartedAt = Date.now();
+        const queuedTasks = taskEntries.map((entry, index) =>
+            createPendingResult(entry.id, entry.snapshot, "running", {
+                logId: replaceLog?.id || anchorLog?.id,
+                createdAt: replaceLog?.createdAt || anchorLog?.createdAt,
+                startedAt: batchStartedAt,
+                versionGroupId: retryVersionMeta?.versionGroupId,
+                versionNo: retryVersionMeta ? retryVersionMeta.nextVersionNo + index : undefined,
+                retryOfLogId: retryVersionMeta?.retryOfLogId,
+                retryOfVersionNo: retryVersionMeta?.retryOfVersionNo,
             }),
         );
-        setResults((value) => [...queuedTasks, ...value.filter((item) => !replaceLog || item.logId !== replaceLog.id)]);
+        setResults((value) => [...queuedTasks, ...value.filter((item) => !anchorLog || item.logId !== anchorLog.id || (item.status !== "waiting" && item.status !== "running"))]);
         setNow(Date.now());
 
         let successCount = 0;
         let failCount = 0;
         let firstFailure: unknown = null;
 
-        for (let index = 0; index < taskIds.length; index += 1) {
-            const resultId = taskIds[index];
+        const runTaskAtIndex = async (index: number) => {
+            const taskEntry = taskEntries[index];
+            const resultId = taskEntry.id;
+            const taskSnapshot = taskEntry.snapshot;
             const startedAt = Date.now();
-            const taskConfig = buildSingleResultLogConfig(snapshot.displayConfig);
+            const taskConfig = buildSingleResultLogConfig(taskSnapshot.displayConfig);
             setResults((value) => updateResult(value, resultId, { status: "running", startedAt, error: undefined, errorDetail: undefined, durationMs: undefined }));
             setNow(startedAt);
             const taskStartedAt = performance.now();
 
             try {
-                const image = await runGenerationTask(resultId, snapshot);
+                const image = await runGenerationTask(resultId, taskSnapshot);
                 successCount += 1;
                 try {
                     const stored = await uploadImage(image.dataUrl);
@@ -472,10 +851,10 @@ export default function ImagePage() {
                     const log = buildLog({
                         id: replaceLog?.id,
                         createdAt: replaceLog?.createdAt,
-                        prompt: snapshot.text,
-                        model: snapshot.displayConfig.imageModel || snapshot.displayConfig.model,
+                        prompt: taskSnapshot.text,
+                        model: taskSnapshot.displayConfig.imageModel || taskSnapshot.displayConfig.model,
                         config: taskConfig,
-                        references: snapshot.references,
+                        references: taskSnapshot.references,
                         durationMs: durableImage.durationMs,
                         successCount: 1,
                         failCount: 0,
@@ -484,6 +863,10 @@ export default function ImagePage() {
                         errors: [],
                         errorDetails: [],
                         categoryIds: batchCategoryIds,
+                        versionGroupId: retryVersionMeta?.versionGroupId,
+                        versionNo: retryVersionMeta ? retryVersionMeta.nextVersionNo + index : undefined,
+                        retryOfLogId: retryVersionMeta?.retryOfLogId,
+                        retryOfVersionNo: retryVersionMeta?.retryOfVersionNo,
                     });
                     setResults((value) => updateResult(value, resultId, { image: durableImage, logId: log.id }));
                     await saveLog(log);
@@ -499,10 +882,10 @@ export default function ImagePage() {
                     const log = buildLog({
                         id: replaceLog?.id,
                         createdAt: replaceLog?.createdAt,
-                        prompt: snapshot.text,
-                        model: snapshot.displayConfig.imageModel || snapshot.displayConfig.model,
+                        prompt: taskSnapshot.text,
+                        model: taskSnapshot.displayConfig.imageModel || taskSnapshot.displayConfig.model,
                         config: taskConfig,
-                        references: snapshot.references,
+                        references: taskSnapshot.references,
                         durationMs: performance.now() - taskStartedAt,
                         successCount: 0,
                         failCount: 1,
@@ -511,28 +894,27 @@ export default function ImagePage() {
                         errors: [nextError],
                         errorDetails: [nextErrorDetail],
                         categoryIds: batchCategoryIds,
+                        versionGroupId: retryVersionMeta?.versionGroupId,
+                        versionNo: retryVersionMeta ? retryVersionMeta.nextVersionNo + index : undefined,
+                        retryOfLogId: retryVersionMeta?.retryOfLogId,
+                        retryOfVersionNo: retryVersionMeta?.retryOfVersionNo,
                     });
                     setResults((value) => updateResult(value, resultId, { logId: log.id }));
                     await saveLog(log);
                 } catch (saveError) {
                     message.error(saveError instanceof Error ? saveError.message : "保存生成记录失败");
                 }
-            } finally {
-                const nextResultId = taskIds[index + 1];
-                if (nextResultId) {
-                    const nextStartedAt = Date.now();
-                    setResults((value) => updateResult(value, nextResultId, { status: "running", startedAt: nextStartedAt }));
-                    setNow(nextStartedAt);
-                }
             }
-        }
+        };
+
+        await Promise.all(taskEntries.map((_entry, index) => runTaskAtIndex(index)));
 
         if (successCount > 0) {
             if (failCount > 0) {
                 message.warning(`已生成 ${successCount} 张，失败 ${failCount} 张`);
                 return;
             }
-            message.success(taskCount > 1 ? `已生成 ${successCount} 张图片` : "图片已生成");
+            message.success(totalTaskCount > 1 ? `已生成 ${successCount} 张图片` : "图片已生成");
             return;
         }
         message.error(firstFailure instanceof Error ? firstFailure.message : "生成失败");
@@ -582,10 +964,50 @@ export default function ImagePage() {
             coverUrl: stored.url,
             tags: [],
             source: "生图工作台",
-            data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType },
+            data: { dataUrl: stored.url, storageKey: stored.storageKey, width: stored.width, height: stored.height, bytes: stored.bytes, mimeType: stored.mimeType, shareId: image.shareId, shareUrl: image.shareUrl },
             metadata: { source: "image-page", prompt },
         });
         message.success("已加入我的素材");
+    };
+
+    const copyGeneratedImageLink = async (image: GeneratedImage, index: number) => {
+        setLinkingImageId(image.id);
+        const hideLoading = message.loading(image.shareUrl ? "正在复制链接..." : "正在生成图片链接...", 0);
+        try {
+            const link = await ensureImageShareLink(image, `image-${index + 1}`);
+            await patchGeneratedImageShareLink(image.id, link);
+            copyText(link.url, "图片链接已复制");
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "图片链接生成失败");
+        } finally {
+            hideLoading();
+            setLinkingImageId("");
+        }
+    };
+
+    const patchGeneratedImageShareLink = async (imageId: string, link: ImageShareLinkResult) => {
+        const patch = { shareId: link.id, shareUrl: link.url };
+        const patchImage = (image: GeneratedImage) => (image.id === imageId ? { ...image, ...patch } : image);
+        setResults((value) => value.map((item) => (item.image?.id === imageId ? { ...item, image: patchImage(item.image) } : item)));
+        const nextPackages = productPackages.map((pkg) => ({ ...pkg, items: pkg.items.map((item) => (item.image?.id === imageId ? { ...item, image: patchImage(item.image) } : item)) }));
+        setProductPackages(nextPackages);
+        setPreviewLog((value) => {
+            if (!value) return value;
+            const nextImages = value.images.map(patchImage);
+            return { ...value, images: nextImages, thumbnails: nextImages.map((image) => image.dataUrl) };
+        });
+
+        let changed = false;
+        const nextLogs = logs.map((log) => {
+            if (!log.images.some((image) => image.id === imageId)) return log;
+            changed = true;
+            const nextImages = log.images.map(patchImage);
+            return { ...log, images: nextImages, thumbnails: nextImages.map((image) => image.dataUrl) };
+        });
+        if (!changed) return;
+        setLogs(nextLogs);
+        await Promise.all(nextLogs.filter((log) => log.images.some((image) => image.id === imageId)).map((log) => logStore.setItem(scopedImageHistoryLogKey(log.id), serializeLog(log))));
+        await persistImageHistory(nextLogs, categories, nextPackages);
     };
 
     const insertPickedAsset = async (payload: InsertAssetPayload) => {
@@ -609,7 +1031,10 @@ export default function ImagePage() {
                 setReferences((value) => [...value, reference]);
             } else {
                 const stored = await uploadImage(payload.dataUrl);
-                setReferences((value) => [...value, { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey, source: payload.source === "library" ? "library" : "upload", temporary: payload.source !== "library" }]);
+                setReferences((value) => [
+                    ...value,
+                    { id: nanoid(), name: payload.title, type: stored.mimeType, dataUrl: stored.url, storageKey: stored.storageKey, source: payload.source === "library" ? "library" : "upload", temporary: payload.source !== "library" },
+                ]);
             }
         } else {
             message.warning("视频素材不能作为生图参考图");
@@ -617,33 +1042,57 @@ export default function ImagePage() {
         setAssetPickerOpen(false);
     };
 
-    const deleteSelectedLogs = () => {
-        const selectedPackageSet = new Set(selectedPackageIds);
-        const packageLogIds = new Set(
-            productPackageFolders
-                .filter((pkg) => selectedPackageSet.has(pkg.id))
-                .flatMap((pkg) => pkg.items.map((item) => item.logId).filter((id): id is string => Boolean(id))),
-        );
-        const selectedLogSet = new Set(selectedLogIds);
+    const deleteSelectedItems = async (options?: { resultIds?: string[]; logIds?: string[]; packageIds?: string[] }) => {
+        const resultIds = options?.resultIds ?? selectedResultIds;
+        const logIds = options?.logIds ?? selectedLogIds;
+        const packageIds = options?.packageIds ?? selectedPackageIds;
+        const selectedResultSet = new Set(resultIds);
+        const selectedPackageSet = new Set(packageIds);
+        const packageLogIds = new Set(productPackageFolders.filter((pkg) => selectedPackageSet.has(pkg.id)).flatMap((pkg) => pkg.items.map((item) => item.logId).filter((id): id is string => Boolean(id))));
+        const selectedLogSet = new Set(logIds);
+        const deletedResults = results.filter((result) => selectedResultSet.has(result.id));
+        let nextResults = results.filter((result) => !selectedResultSet.has(result.id));
         const deletedLogs = logs.filter((log) => selectedLogSet.has(log.id) || packageLogIds.has(log.id));
         const nextLogs = logs.filter((log) => !selectedLogSet.has(log.id) && !packageLogIds.has(log.id));
-        const retainedKeys = collectImageStorageKeys({ assets: useAssetStore.getState().assets, projects: useCanvasStore.getState().projects, results, references });
-        const imageKeys = disposableLogStorageKeys(deletedLogs, nextLogs, retainedKeys);
-        void Promise.all([deleteStoredImages(imageKeys), ...deletedLogs.map((log) => logStore.removeItem(scopedImageHistoryLogKey(log.id)))]).then(async () => {
-            setLogs(nextLogs);
-            setProductPackages((value) => value.filter((pkg) => !selectedPackageSet.has(pkg.id)));
-            setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
-            await persistImageHistory(nextLogs, categories);
-            await refreshLogs();
-        });
+        const deletedLogIds = new Set(deletedLogs.map((log) => log.id));
+        const nextPackages = reconcileProductPackagesAfterLogDeletion(productPackages, nextLogs, deletedLogIds, selectedPackageSet);
         if (previewLog && (selectedLogSet.has(previewLog.id) || packageLogIds.has(previewLog.id))) {
             setPreviewLog(null);
-            setResults((value) => value.filter((item) => item.status === "waiting" || item.status === "running"));
+            nextResults = nextResults.filter((item) => item.status === "waiting" || item.status === "running");
         }
-        if (activePackageId && selectedPackageSet.has(activePackageId)) setActivePackageId(null);
-        setSelectedLogIds([]);
-        setSelectedPackageIds([]);
-        setDeleteConfirmOpen(false);
+        const retainedKeys = collectImageStorageKeys({ assets: useAssetStore.getState().assets, projects: useCanvasStore.getState().projects, logs: nextLogs, productPackages: nextPackages, results: nextResults, references });
+        const imageKeys = Array.from(new Set([...disposableLogStorageKeys(deletedLogs, nextLogs, retainedKeys), ...disposableResultStorageKeys(deletedResults, retainedKeys)]));
+        try {
+            await Promise.all([deleteStoredImages(imageKeys), ...deletedLogs.map((log) => logStore.removeItem(scopedImageHistoryLogKey(log.id)))]);
+            setResults(nextResults);
+            setLogs(nextLogs);
+            setProductPackages(nextPackages);
+            setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
+            if (deletedLogs.length || selectedPackageSet.size) {
+                await persistImageHistory(nextLogs, categories, nextPackages);
+                await refreshLogs();
+            }
+            if (activePackageId && !nextPackages.some((pkg) => pkg.id === activePackageId)) setActivePackageId(null);
+            setSelectedResultIds((value) => value.filter((id) => !selectedResultSet.has(id)));
+            setSelectedLogIds((value) => value.filter((id) => !selectedLogSet.has(id) && !packageLogIds.has(id)));
+            setSelectedPackageIds((value) => value.filter((id) => !selectedPackageSet.has(id)));
+            setDeleteConfirmOpen(false);
+        } catch (error) {
+            message.error(error instanceof Error ? error.message : "删除失败");
+        }
+    };
+
+    const deleteSelectedLogs = () => void deleteSelectedItems();
+
+    const deleteResult = (result: GenerationResult) => {
+        modal.confirm({
+            title: "删除新生成结果",
+            content: "确定删除这张新生成结果吗？",
+            okText: "删除",
+            cancelText: "取消",
+            okButtonProps: { danger: true },
+            onOk: () => deleteSelectedItems({ resultIds: [result.id], logIds: [], packageIds: [] }),
+        });
     };
 
     const deleteLog = (log: GenerationLog) => {
@@ -655,14 +1104,18 @@ export default function ImagePage() {
             okButtonProps: { danger: true },
             onOk: async () => {
                 const nextLogs = logs.filter((item) => item.id !== log.id);
+                const deletedLogIds = new Set([log.id]);
+                const nextPackages = reconcileProductPackagesAfterLogDeletion(productPackages, nextLogs, deletedLogIds);
                 const retainedKeys = collectImageStorageKeys({ assets: useAssetStore.getState().assets, projects: useCanvasStore.getState().projects, results, references });
                 const imageKeys = disposableLogStorageKeys([log], nextLogs, retainedKeys);
                 await Promise.all([deleteStoredImages(imageKeys), logStore.removeItem(scopedImageHistoryLogKey(log.id))]);
                 setLogs(nextLogs);
+                setProductPackages(nextPackages);
                 setReferences((value) => value.filter((item) => !item.storageKey || !imageKeys.includes(item.storageKey)));
-                await persistImageHistory(nextLogs, categories);
+                await persistImageHistory(nextLogs, categories, nextPackages);
                 setSelectedLogIds((value) => value.filter((id) => id !== log.id));
                 if (previewLog?.id === log.id) setPreviewLog(null);
+                if (activePackageId && !nextPackages.some((pkg) => pkg.id === activePackageId)) setActivePackageId(null);
                 await refreshLogs();
             },
         });
@@ -673,44 +1126,56 @@ export default function ImagePage() {
         const nextLogs = [log, ...storedLogs.filter((item) => item.id !== log.id)].sort((a, b) => b.createdAt - a.createdAt);
         setLogs(nextLogs);
         await logStore.setItem(scopedImageHistoryLogKey(log.id), serializeLog(log));
-        await persistImageHistory(nextLogs, categories);
+        await persistImageHistory(nextLogs, categories, productPackages);
         await refreshLogs();
     };
 
     const refreshLogs = async () => setLogs(await readStoredLogs());
     const refreshCategories = async () => setCategories(await readStoredCategories());
+    const refreshProductPackages = async () => {
+        const storedPackages = await readStoredProductPackages();
+        productPackagesLoadedRef.current = true;
+        setProductPackages(storedPackages);
+    };
 
     const loadAccountImageHistory = async (currentToken: string) => {
         try {
             const config = await fetchUserConfig(currentToken);
             accountHistorySyncEnabledRef.current = config.syncCapabilities?.userData === true;
-            const remote = config.imageHistory as { logs?: GenerationLog[]; categories?: GenerationCategory[] } | undefined;
+            const remote = config.imageHistory as { logs?: GenerationLog[]; categories?: GenerationCategory[]; packages?: ProductImagePackage[] } | undefined;
             const remoteLogs = Array.isArray(remote?.logs) ? remote.logs : [];
             const remoteCategories = Array.isArray(remote?.categories) ? remote.categories : [];
-            if (remoteLogs.length || remoteCategories.length) {
+            const remotePackages = await normalizeProductPackages(Array.isArray(remote?.packages) ? remote.packages : []);
+            if (remoteLogs.length || remoteCategories.length || remotePackages.length) {
                 const localLogs = await readStoredLogs();
                 const localCategories = await readStoredCategories();
+                const localPackages = await readStoredProductPackages();
                 const mergedLogs = await mergeGenerationLogs(remoteLogs, localLogs);
                 const mergedCategories = mergeGenerationCategories(remoteCategories, localCategories);
+                const mergedPackages = mergeProductPackages(remotePackages, localPackages);
                 await replaceStoredImageHistory(mergedLogs, mergedCategories);
+                await replaceStoredProductPackages(mergedPackages);
                 setLogs(mergedLogs);
                 setCategories(mergedCategories);
-                if (accountHistorySyncEnabledRef.current && (mergedLogs.length !== remoteLogs.length || mergedCategories.length !== remoteCategories.length || mergedLogs.some(hasUnsyncedLocalImages))) {
-                    await syncUserImageHistory(currentToken, await imageHistorySnapshot(mergedLogs, mergedCategories));
+                productPackagesLoadedRef.current = true;
+                setProductPackages(mergedPackages);
+                if (accountHistorySyncEnabledRef.current && (mergedLogs.length !== remoteLogs.length || mergedCategories.length !== remoteCategories.length || mergedPackages.length !== remotePackages.length || mergedLogs.some(hasUnsyncedLocalImages))) {
+                    await syncUserImageHistory(currentToken, await imageHistorySnapshot(mergedLogs, mergedCategories, mergedPackages));
                 }
                 return;
             }
             const localLogs = await readStoredLogs();
             const localCategories = await readStoredCategories();
-            if (accountHistorySyncEnabledRef.current && (localLogs.length || localCategories.length)) await syncUserImageHistory(currentToken, await imageHistorySnapshot(localLogs, localCategories));
+            const localPackages = await readStoredProductPackages();
+            if (accountHistorySyncEnabledRef.current && (localLogs.length || localCategories.length || localPackages.length)) await syncUserImageHistory(currentToken, await imageHistorySnapshot(localLogs, localCategories, localPackages));
         } catch {
             // Keep local history available when account sync fails.
         }
     };
 
-    const persistImageHistory = async (nextLogs: GenerationLog[], nextCategories: GenerationCategory[]) => {
+    const persistImageHistory = async (nextLogs: GenerationLog[], nextCategories: GenerationCategory[], nextPackages: ProductImagePackage[] = productPackages) => {
         if (!token || !accountHistorySyncEnabledRef.current) return;
-        await syncUserImageHistory(token, await imageHistorySnapshot(nextLogs, nextCategories)).catch(() => {
+        await syncUserImageHistory(token, await imageHistorySnapshot(nextLogs, nextCategories, nextPackages)).catch(() => {
             accountHistorySyncEnabledRef.current = false;
         });
     };
@@ -823,9 +1288,8 @@ export default function ImagePage() {
         if (typeof log.config.codexCli === "boolean") updateConfig("codexCli", log.config.codexCli);
     };
 
-    const copyPrompt = async (text: string) => {
-        await navigator.clipboard.writeText(text);
-        message.success("提示词已复制");
+    const copyPrompt = (text: string) => {
+        copyText(text, "提示词已复制");
     };
 
     const buildRequestSnapshot = ({ promptText = prompt, referenceItems = references, taskCount = generationCount }: { promptText?: string; referenceItems?: ReferenceImage[]; taskCount?: number } = {}) => {
@@ -876,9 +1340,8 @@ export default function ImagePage() {
     const retryResult = (result: GenerationResult) => {
         const snapshot = buildRequestSnapshot({ promptText: result.prompt, referenceItems: result.references, taskCount: 1 });
         if (!snapshot) return;
-        const replaceLog = result.logId ? logs.find((item) => item.id === result.logId) || null : null;
-        setResults((value) => value.filter((item) => item.id !== result.id && (!replaceLog || item.logId !== replaceLog.id)));
-        void submitGenerationBatch(snapshot, { replaceLog });
+        const retrySourceLog = result.logId ? logs.find((item) => item.id === result.logId) || null : null;
+        void submitGenerationBatch(snapshot, { anchorLog: retrySourceLog, retrySourceLog });
     };
 
     const updateResultPrompt = (resultId: string, promptText: string) => {
@@ -892,18 +1355,19 @@ export default function ImagePage() {
         return true;
     };
 
-    const retryPackageItem = async (packageId: string, itemId: string) => {
+    const retryPackageItem = async (packageId: string, itemId: string, promptOverride?: string) => {
         const targetPackage = productPackageFolders.find((pkg) => pkg.id === packageId);
         const targetItem = targetPackage?.items.find((item) => item.id === itemId);
         if (!targetPackage || !targetItem) {
             message.error("没有找到这张图");
             return;
         }
-        const promptText = targetItem.prompt.trim();
+        const promptText = (promptOverride ?? targetItem.prompt).trim();
         if (!promptText) {
             message.error("这张图还没有可用提示词");
             return;
         }
+        const workingItem = { ...targetItem, prompt: promptText };
         const itemModel = targetItem.model || effectiveConfig.imageModel || effectiveConfig.model;
         const requestConfig: AiConfig = {
             ...effectiveConfig,
@@ -930,9 +1394,11 @@ export default function ImagePage() {
         }
 
         const livePackage = clonePackageForRetry(targetPackage);
-        const retryReferences = (targetItem.references.length ? targetItem.references : targetPackage.references).filter((item) => Boolean(item.dataUrl));
-        const existingLog = findPackageLogForRetry(logs, packageId, targetItem);
-        const nextLogId = existingLog?.id || targetItem.logId || nanoid();
+        const retryReferences = (workingItem.references.length ? workingItem.references : targetPackage.references).filter((item) => Boolean(item.dataUrl));
+        const historyLogs = packageItemHistoryLogs(logs, packageId, workingItem.index);
+        const existingLog = findPackageLogForRetry(logs, packageId, workingItem);
+        const nextLogId = nanoid();
+        const retryVersionMeta = buildPackageItemRetryVersionMeta(packageId, workingItem.index, existingLog, historyLogs);
         const startedAt = Date.now();
         const resolvedPrompt = resolvePromptReferences(promptText, retryReferences);
         if (resolvedPrompt.error) {
@@ -944,16 +1410,16 @@ export default function ImagePage() {
             return;
         }
 
-        setProductPackages((value) => upsertRetriedPackage(value, livePackage, itemId, { status: "running", startedAt, endedAt: undefined, durationMs: undefined, error: undefined, errorDetail: undefined, image: undefined, logId: nextLogId }));
+        setProductPackages((value) =>
+            upsertRetriedPackage(value, livePackage, itemId, { prompt: promptText, status: "running", selected: false, startedAt, endedAt: undefined, durationMs: undefined, error: undefined, errorDetail: undefined, image: undefined, logId: nextLogId }),
+        );
         setActivePackageId(packageId);
         setResultViewMode("all");
         setActiveResultCategoryId(null);
         setNow(Date.now());
 
         try {
-            const result = resolvedPrompt.references.length
-                ? await requestEdit(requestConfig, resolvedPrompt.requestText, resolvedPrompt.references)
-                : await requestGeneration(requestConfig, resolvedPrompt.requestText);
+            const result = resolvedPrompt.references.length ? await requestEdit(requestConfig, resolvedPrompt.requestText, resolvedPrompt.references) : await requestGeneration(requestConfig, resolvedPrompt.requestText);
             const image = result[0];
             if (!image) throw new Error("接口没有返回图片");
             const meta = await readImageMeta(image.dataUrl);
@@ -970,12 +1436,25 @@ export default function ImagePage() {
                 bytes: stored.bytes || getDataUrlByteSize(image.dataUrl),
                 mimeType: stored.mimeType || meta.mimeType,
             };
-            setProductPackages((value) => upsertRetriedPackage(value, livePackage, itemId, { status: "success", startedAt, endedAt, durationMs: endedAt - startedAt, error: undefined, errorDetail: undefined, image: nextImage, logId: nextLogId }));
+            setProductPackages((value) =>
+                upsertRetriedPackage(value, livePackage, itemId, {
+                    prompt: promptText,
+                    status: "success",
+                    selected: false,
+                    startedAt,
+                    endedAt,
+                    durationMs: endedAt - startedAt,
+                    error: undefined,
+                    errorDetail: undefined,
+                    image: nextImage,
+                    logId: nextLogId,
+                }),
+            );
             const nextLog = buildPackageRetryLog({
                 baseLog: existingLog,
                 logId: nextLogId,
                 packageData: targetPackage,
-                item: targetItem,
+                item: workingItem,
                 prompt: promptText,
                 model: itemModel,
                 config: buildGenerationLogConfig({ ...requestConfig, model: itemModel, imageModel: itemModel, count: "1" }),
@@ -985,6 +1464,10 @@ export default function ImagePage() {
                 errors: [],
                 errorDetails: [],
                 status: "成功",
+                versionGroupId: retryVersionMeta.versionGroupId,
+                versionNo: retryVersionMeta.nextVersionNo,
+                retryOfLogId: retryVersionMeta.retryOfLogId,
+                retryOfVersionNo: retryVersionMeta.retryOfVersionNo,
             });
             await saveLog(nextLog);
             message.success(`${targetItem.title} 已重新生成`);
@@ -992,12 +1475,25 @@ export default function ImagePage() {
             const endedAt = Date.now();
             const nextError = errorMessage(error);
             const nextErrorDetail = errorDetail(error);
-            setProductPackages((value) => upsertRetriedPackage(value, livePackage, itemId, { status: "failed", startedAt, endedAt, durationMs: endedAt - startedAt, error: nextError, errorDetail: nextErrorDetail, image: undefined, logId: nextLogId }));
+            setProductPackages((value) =>
+                upsertRetriedPackage(value, livePackage, itemId, {
+                    prompt: promptText,
+                    status: "failed",
+                    selected: false,
+                    startedAt,
+                    endedAt,
+                    durationMs: endedAt - startedAt,
+                    error: nextError,
+                    errorDetail: nextErrorDetail,
+                    image: undefined,
+                    logId: nextLogId,
+                }),
+            );
             const nextLog = buildPackageRetryLog({
                 baseLog: existingLog,
                 logId: nextLogId,
                 packageData: targetPackage,
-                item: targetItem,
+                item: workingItem,
                 prompt: promptText,
                 model: itemModel,
                 config: buildGenerationLogConfig({ ...requestConfig, model: itemModel, imageModel: itemModel, count: "1" }),
@@ -1007,6 +1503,10 @@ export default function ImagePage() {
                 errors: [nextError],
                 errorDetails: [nextErrorDetail],
                 status: "失败",
+                versionGroupId: retryVersionMeta.versionGroupId,
+                versionNo: retryVersionMeta.nextVersionNo,
+                retryOfLogId: retryVersionMeta.retryOfLogId,
+                retryOfVersionNo: retryVersionMeta.retryOfVersionNo,
             });
             await saveLog(nextLog);
             message.error(nextError);
@@ -1092,16 +1592,16 @@ export default function ImagePage() {
         message.success("图包 Demo 已创建，已跳到结果页");
     };
 
-    const updatePackageItemPrompt = async (packageId: string, itemId: string, nextPrompt: string) => {
+    const updatePackageItemPrompt = async (packageId: string, itemId: string, nextPrompt: string, options?: { silent?: boolean; allowEmpty?: boolean }) => {
         const promptText = nextPrompt.trim();
-        if (!promptText) {
+        if (!promptText && !options?.allowEmpty) {
             message.error("提示词不能为空");
             return;
         }
         const targetPackage = productPackageFolders.find((pkg) => pkg.id === packageId);
         const targetItem = targetPackage?.items.find((item) => item.id === itemId);
         if (!targetPackage || !targetItem) {
-            message.error("没有找到这张图");
+            if (!options?.silent) message.error("没有找到这张图");
             return;
         }
         if (productPackages.some((pkg) => pkg.id === packageId && pkg.items.some((item) => item.id === itemId))) {
@@ -1117,14 +1617,14 @@ export default function ImagePage() {
                 ),
             );
         }
-        if (targetItem.logId) {
+        if (targetItem.logId && promptText) {
             const nextLogs = logs.map((log) => (log.id === targetItem.logId ? { ...log, prompt: promptText, title: targetItem.title || log.title } : log));
             const nextLog = nextLogs.find((log) => log.id === targetItem.logId);
             setLogs(nextLogs);
             if (nextLog) await logStore.setItem(scopedImageHistoryLogKey(nextLog.id), serializeLog(nextLog));
             await persistImageHistory(nextLogs, categories);
         }
-        message.success("提示词已更新");
+        if (!options?.silent) message.success("提示词已更新");
     };
 
     const handleWorkflowTaskStarted = (task: WorkflowExternalTaskStart) => {
@@ -1307,7 +1807,15 @@ export default function ImagePage() {
                 {workbenchLayout === "side" ? (
                     <>
                         {activePackage ? (
-                            <PackageWorkbenchPanel packageData={activePackage} currentReferences={references} currentLayout={workbenchLayout} onLayoutChange={setWorkbenchLayout} onClose={() => setActivePackageId(null)} onEditWorkflow={() => openPackageWorkflowRunner(activePackage)} onRemoveReference={(id) => void removeReference(id)} />
+                            <PackageWorkbenchPanel
+                                packageData={activePackage}
+                                currentReferences={references}
+                                currentLayout={workbenchLayout}
+                                onLayoutChange={setWorkbenchLayout}
+                                onClose={() => setActivePackageId(null)}
+                                onEditWorkflow={() => openPackageWorkflowRunner(activePackage)}
+                                onRemoveReference={(id) => void removeReference(id)}
+                            />
                         ) : (
                             <WorkbenchPanel
                                 layout="side"
@@ -1317,9 +1825,11 @@ export default function ImagePage() {
                                 references={references}
                                 config={effectiveConfig}
                                 model={model}
+                                batchMode={batchMode}
                                 canGenerate={canGenerate}
                                 pendingCount={pendingCount}
                                 updateConfig={updateConfig}
+                                onBatchModeChange={setBatchMode}
                                 openConfigDialog={openConfigDialog}
                                 onLayoutChange={setWorkbenchLayout}
                                 onToggleSection={toggleCollapsedSection}
@@ -1331,6 +1841,7 @@ export default function ImagePage() {
                                 onClearPrompt={clearPrompt}
                                 onPasteReferences={() => void addReferencesFromClipboard()}
                                 onUploadReferences={() => fileInputRef.current?.click()}
+                                onImportPackageFolder={() => folderInputRef.current?.click()}
                                 onRemoveReference={(id) => void removeReference(id)}
                                 onGenerate={() => void generate()}
                             />
@@ -1347,9 +1858,12 @@ export default function ImagePage() {
                             now={now}
                             selectedLogIds={selectedLogIds}
                             selectedPackageIds={selectedPackageIds}
+                            selectedResultIds={selectedResultIds}
                             activeLogId={previewLog?.id}
+                            linkingImageId={linkingImageId}
                             onSelectedLogIdsChange={setSelectedLogIds}
                             onSelectedPackageIdsChange={setSelectedPackageIds}
+                            onSelectedResultIdsChange={setSelectedResultIds}
                             onResultViewModeChange={setResultViewMode}
                             onActiveCategoryChange={setActiveResultCategoryId}
                             onOpenPackage={setActivePackageId}
@@ -1361,16 +1875,22 @@ export default function ImagePage() {
                             onClearLogCategories={(log) => void updateLogCategories(log, [])}
                             onDeleteSelected={() => setDeleteConfirmOpen(true)}
                             onDeleteLog={deleteLog}
+                            onDeleteResult={deleteResult}
                             onPreviewLog={(log) => void previewGenerationLog(log)}
                             onRetryLog={(log) => void retryLog(log)}
                             onCopyPrompt={copyPrompt}
                             onUpdateLogPrompt={updateHistoryLogPrompt}
                             onUpdateResultPrompt={updateResultPrompt}
-                            onUpdatePackageItemPrompt={(packageId, itemId, nextPrompt) => void updatePackageItemPrompt(packageId, itemId, nextPrompt)}
-                            onRetryPackageItem={(packageId, itemId) => void retryPackageItem(packageId, itemId)}
+                            onUpdatePackageItemPrompt={(packageId, itemId, nextPrompt, options) => void updatePackageItemPrompt(packageId, itemId, nextPrompt, options)}
+                            onRetryPackageItem={(packageId, itemId, promptOverride) => void retryPackageItem(packageId, itemId, promptOverride)}
+                            onTogglePackageItemSelected={togglePackageItemSelected}
+                            onSelectPackageItems={selectPackageItems}
+                            onStartSelectedPackageItems={(packageId, group, promptOverride) => void startSelectedPackageItems(packageId, group, promptOverride)}
+                            onImportPackageFolder={() => folderInputRef.current?.click()}
                             onEdit={addResultToReferences}
                             onDownload={downloadImage}
                             onDownloadPackageItem={(item) => item.image && void downloadImage(item.image, item.index - 1)}
+                            onCopyImageLink={copyGeneratedImageLink}
                             onSaveAsset={saveResultToAssets}
                             onRetry={retryResult}
                         />
@@ -1378,7 +1898,7 @@ export default function ImagePage() {
                 ) : (
                     <>
                         <ResultsPanel
-                            className="min-h-[360px] flex-1 pb-40 lg:pb-44"
+                            className={cn("min-h-[360px] flex-1 transition-[padding-bottom]", activePackage ? "pb-4" : workbenchBottomCollapsed ? "pb-24 lg:pb-24" : "pb-[300px] lg:pb-[320px]")}
                             results={results}
                             productPackages={productPackageFolders}
                             activePackageId={activePackageId}
@@ -1390,9 +1910,12 @@ export default function ImagePage() {
                             now={now}
                             selectedLogIds={selectedLogIds}
                             selectedPackageIds={selectedPackageIds}
+                            selectedResultIds={selectedResultIds}
                             activeLogId={previewLog?.id}
+                            linkingImageId={linkingImageId}
                             onSelectedLogIdsChange={setSelectedLogIds}
                             onSelectedPackageIdsChange={setSelectedPackageIds}
+                            onSelectedResultIdsChange={setSelectedResultIds}
                             onResultViewModeChange={setResultViewMode}
                             onActiveCategoryChange={setActiveResultCategoryId}
                             onOpenPackage={setActivePackageId}
@@ -1404,44 +1927,57 @@ export default function ImagePage() {
                             onClearLogCategories={(log) => void updateLogCategories(log, [])}
                             onDeleteSelected={() => setDeleteConfirmOpen(true)}
                             onDeleteLog={deleteLog}
+                            onDeleteResult={deleteResult}
                             onPreviewLog={(log) => void previewGenerationLog(log)}
                             onRetryLog={(log) => void retryLog(log)}
                             onCopyPrompt={copyPrompt}
                             onUpdateLogPrompt={updateHistoryLogPrompt}
                             onUpdateResultPrompt={updateResultPrompt}
-                            onUpdatePackageItemPrompt={(packageId, itemId, nextPrompt) => void updatePackageItemPrompt(packageId, itemId, nextPrompt)}
-                            onRetryPackageItem={(packageId, itemId) => void retryPackageItem(packageId, itemId)}
+                            onUpdatePackageItemPrompt={(packageId, itemId, nextPrompt, options) => void updatePackageItemPrompt(packageId, itemId, nextPrompt, options)}
+                            onRetryPackageItem={(packageId, itemId, promptOverride) => void retryPackageItem(packageId, itemId, promptOverride)}
+                            onTogglePackageItemSelected={togglePackageItemSelected}
+                            onSelectPackageItems={selectPackageItems}
+                            onStartSelectedPackageItems={(packageId, group, promptOverride) => void startSelectedPackageItems(packageId, group, promptOverride)}
+                            onImportPackageFolder={() => folderInputRef.current?.click()}
                             onEdit={addResultToReferences}
                             onDownload={downloadImage}
                             onDownloadPackageItem={(item) => item.image && void downloadImage(item.image, item.index - 1)}
+                            onCopyImageLink={copyGeneratedImageLink}
                             onSaveAsset={saveResultToAssets}
                             onRetry={retryResult}
                         />
-                        <WorkbenchPanel
-                            layout="bottom"
-                            currentLayout={workbenchLayout}
-                            collapsedSections={collapsedSections}
-                            prompt={prompt}
-                            references={references}
-                            config={effectiveConfig}
-                            model={model}
-                            canGenerate={canGenerate}
-                            pendingCount={pendingCount}
-                            updateConfig={updateConfig}
-                            openConfigDialog={openConfigDialog}
-                            onLayoutChange={setWorkbenchLayout}
-                            onToggleSection={toggleCollapsedSection}
-                            onPromptChange={setPrompt}
-                            onOpenPromptLibrary={() => setPromptDialogOpen(true)}
-                            onOpenAssetPicker={() => setAssetPickerOpen(true)}
-                            onPastePrompt={() => void pastePromptFromClipboard()}
-                            onPromptPaste={(event) => void pasteReferenceImagesIntoPrompt(event)}
-                            onClearPrompt={clearPrompt}
-                            onPasteReferences={() => void addReferencesFromClipboard()}
-                            onUploadReferences={() => fileInputRef.current?.click()}
-                            onRemoveReference={(id) => void removeReference(id)}
-                            onGenerate={() => void generate()}
-                        />
+                        {!activePackage ? (
+                            <WorkbenchPanel
+                                layout="bottom"
+                                currentLayout={workbenchLayout}
+                                collapsedSections={collapsedSections}
+                                prompt={prompt}
+                                references={references}
+                                config={effectiveConfig}
+                                model={model}
+                                batchMode={batchMode}
+                                canGenerate={canGenerate}
+                                pendingCount={pendingCount}
+                                updateConfig={updateConfig}
+                                onBatchModeChange={setBatchMode}
+                                openConfigDialog={openConfigDialog}
+                                onLayoutChange={setWorkbenchLayout}
+                                onToggleSection={toggleCollapsedSection}
+                                onPromptChange={setPrompt}
+                                onOpenPromptLibrary={() => setPromptDialogOpen(true)}
+                                onOpenAssetPicker={() => setAssetPickerOpen(true)}
+                                onPastePrompt={() => void pastePromptFromClipboard()}
+                                onPromptPaste={(event) => void pasteReferenceImagesIntoPrompt(event)}
+                                onClearPrompt={clearPrompt}
+                                onPasteReferences={() => void addReferencesFromClipboard()}
+                                onUploadReferences={() => fileInputRef.current?.click()}
+                                onImportPackageFolder={() => folderInputRef.current?.click()}
+                                onRemoveReference={(id) => void removeReference(id)}
+                                onGenerate={() => void generate()}
+                                bottomCollapsed={workbenchBottomCollapsed}
+                                onBottomCollapsedChange={setWorkbenchBottomCollapsed}
+                            />
+                        ) : null}
                     </>
                 )}
             </main>
@@ -1465,7 +2001,7 @@ export default function ImagePage() {
                 <WandSparkles className="size-4 text-sky-500 dark:text-sky-300" />
                 工作流
             </button>
-            <Drawer title="创作工作流" placement="right" size="min(1120px, 92vw)" open={workflowDrawerOpen}  onClose={() => setWorkflowDrawerOpen(false)} styles={{ body: { padding: 0 } }} destroyOnHidden={false}>
+            <Drawer title="创作工作流" placement="right" size="min(1120px, 92vw)" open={workflowDrawerOpen} onClose={() => setWorkflowDrawerOpen(false)} styles={{ body: { padding: 0 } }} destroyOnHidden={false}>
                 <CreativeWorkflowWorkspace
                     embedded
                     hideTaskList
@@ -1497,6 +2033,17 @@ export default function ImagePage() {
                     event.target.value = "";
                 }}
             />
+            <input
+                ref={folderInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={(event) => {
+                    void importPackageFolder(event.target.files);
+                    event.target.value = "";
+                }}
+            />
             {promptLibraryEnabled ? <PromptSelectDialog open={promptDialogOpen} onOpenChange={setPromptDialogOpen} onSelect={setPrompt} /> : null}
             <AssetPickerModal open={assetPickerOpen} defaultTab="my-assets" onInsert={(payload) => void insertPickedAsset(payload)} onClose={() => setAssetPickerOpen(false)} />
             <PackageQuickStartModal
@@ -1512,7 +2059,7 @@ export default function ImagePage() {
                 onSubmit={startPackageQuickStartDemo}
             />
             <Modal title="删除生成记录" open={deleteConfirmOpen} onCancel={() => setDeleteConfirmOpen(false)} onOk={deleteSelectedLogs} okText="删除" okButtonProps={{ danger: true }} cancelText="取消">
-                确定删除选中的 {selectedLogIds.length + selectedPackageIds.length} 项吗？
+                确定删除选中的 {selectedResultIds.length + selectedLogIds.length + selectedPackageIds.length} 项吗？
             </Modal>
         </div>
     );
@@ -1526,16 +2073,13 @@ const quickSizeOptions = [
     { value: "4:3", label: "4:3" },
     { value: "3:4", label: "3:4" },
     { value: "9:16", label: "9:16" },
-    { value: "2048x2048", label: "1:1 2k" },
-    { value: "2048x1152", label: "16:9 2k" },
-    { value: "1152x2048", label: "9:16 2k" },
+    { value: "16:9", label: "16:9" },
 ];
 
-const quickQualityOptions = [
-    { value: "auto", label: "自动" },
-    { value: "high", label: "高" },
-    { value: "medium", label: "中" },
-    { value: "low", label: "低" },
+const quickResolutionOptions = [
+    { value: "1k", label: "1K" },
+    { value: "2k", label: "2K" },
+    { value: "4k", label: "4K" },
 ];
 
 const quickFormatOptions = [
@@ -1548,6 +2092,10 @@ const quickModerationOptions = [
     { value: "auto", label: "自动" },
     { value: "low", label: "低" },
 ];
+
+const fullImageWrapperStyle: CSSProperties = { width: "100%", height: "100%" };
+const fullImageContainStyle: CSSProperties = { width: "100%", height: "100%", objectFit: "contain" };
+const thumbnailImageCoverStyle: CSSProperties = { width: "100%", height: "100%", objectFit: "cover" };
 
 function PackageWorkbenchPanel({
     packageData,
@@ -1569,6 +2117,8 @@ function PackageWorkbenchPanel({
     const stats = getVisiblePackageStats(packageData);
     const groupCounts = getVisiblePackageGroupCounts(packageData);
     const displayReferences = currentReferences.length ? currentReferences : packageData.references;
+    const canEditWorkflow = packageData.workflowId !== folderPackageWorkflowId;
+    const isFolderPackage = packageData.workflowId === folderPackageWorkflowId;
     return (
         <div className="flex min-h-[420px] flex-col overflow-hidden rounded-lg border border-stone-200 bg-card shadow-sm dark:border-stone-800 lg:min-h-0">
             <div className="shrink-0 border-b border-stone-200 p-4 dark:border-stone-800">
@@ -1582,19 +2132,27 @@ function PackageWorkbenchPanel({
                         <p className="mt-1 text-sm text-stone-500 dark:text-stone-400">{packageData.workflowName}</p>
                     </div>
                     <div className="flex shrink-0 gap-2">
-                        <Button size="small" type="primary" icon={<WandSparkles className="size-3.5" />} onClick={onEditWorkflow}>
-                            修改工作流
-                        </Button>
+                        {canEditWorkflow ? (
+                            <Button size="small" type="primary" icon={<WandSparkles className="size-3.5" />} onClick={onEditWorkflow}>
+                                修改工作流
+                            </Button>
+                        ) : null}
                         <Button size="small" onClick={onClose}>
                             返回
                         </Button>
                     </div>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-1.5">
-                    {groupCounts.main ? <Tag className="m-0" color="blue">主图 {groupCounts.main}</Tag> : null}
-                    {groupCounts.sub ? <Tag className="m-0" color="cyan">副图 {groupCounts.sub}</Tag> : null}
-                    {groupCounts.detail ? <Tag className="m-0" color="purple">详情图 {groupCounts.detail}</Tag> : null}
-                    <Tag className="m-0">{stats.success}/{stats.total} 完成</Tag>
+                    {packageGroupOrder.map((group) =>
+                        groupCounts[group] ? (
+                            <Tag key={group} className="m-0" color={packageGroupColor(group)}>
+                                {packageGroupTitle(group)} {groupCounts[group]}
+                            </Tag>
+                        ) : null,
+                    )}
+                    <Tag className="m-0">
+                        {stats.success}/{stats.total} 完成
+                    </Tag>
                 </div>
                 <div className="mt-3 h-2 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-800">
                     <div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${stats.percent}%` }} />
@@ -1604,12 +2162,14 @@ function PackageWorkbenchPanel({
                 <section className="rounded-lg border border-stone-200 bg-background p-3 dark:border-stone-800">
                     <div className="mb-2 text-sm font-semibold">填写信息</div>
                     <div className="space-y-2 text-xs">
-                        {Object.entries(packageData.inputs).filter(([, value]) => String(value).trim()).map(([key, value]) => (
-                            <div key={key} className="rounded-md bg-stone-50 p-2 dark:bg-stone-900">
-                                <div className="mb-1 text-stone-500 dark:text-stone-400">{packageInputLabel(key)}</div>
-                                <div className="whitespace-pre-wrap text-stone-800 dark:text-stone-200">{String(value)}</div>
-                            </div>
-                        ))}
+                        {Object.entries(packageData.inputs)
+                            .filter(([, value]) => String(value).trim())
+                            .map(([key, value]) => (
+                                <div key={key} className="rounded-md bg-stone-50 p-2 dark:bg-stone-900">
+                                    <div className="mb-1 text-stone-500 dark:text-stone-400">{packageInputLabel(key)}</div>
+                                    <div className="whitespace-pre-wrap text-stone-800 dark:text-stone-200">{String(value)}</div>
+                                </div>
+                            ))}
                         {!Object.values(packageData.inputs).some((value) => String(value).trim()) ? <div className="rounded-md bg-stone-50 p-3 text-center text-stone-500 dark:bg-stone-900">暂无填写信息</div> : null}
                     </div>
                 </section>
@@ -1622,9 +2182,15 @@ function PackageWorkbenchPanel({
                     <div className="flex flex-wrap gap-1.5">
                         <Tag className="m-0">{packageData.model}</Tag>
                         <Tag className="m-0">{packageData.config.apiMode === "responses" ? "Responses" : "Images"}</Tag>
-                        <Tag className="m-0">主/副 1:1</Tag>
-                        <Tag className="m-0">详情 9:16</Tag>
-                        <Tag className="m-0">{packageData.config.quality || "auto"}</Tag>
+                        {isFolderPackage ? (
+                            <Tag className="m-0">跟随参考图比例</Tag>
+                        ) : (
+                            <>
+                                <Tag className="m-0">主/副 1:1</Tag>
+                                <Tag className="m-0">详情 9:16</Tag>
+                            </>
+                        )}
+                        <Tag className="m-0">{imageResolutionLabel(packageData.config.size || "auto")}</Tag>
                     </div>
                 </section>
             </div>
@@ -1650,9 +2216,11 @@ function WorkbenchPanel({
     references,
     config,
     model,
+    batchMode,
     canGenerate,
     pendingCount,
     updateConfig,
+    onBatchModeChange,
     openConfigDialog,
     onLayoutChange,
     onToggleSection,
@@ -1664,8 +2232,11 @@ function WorkbenchPanel({
     onClearPrompt,
     onPasteReferences,
     onUploadReferences,
+    onImportPackageFolder,
     onRemoveReference,
     onGenerate,
+    bottomCollapsed = false,
+    onBottomCollapsedChange,
 }: {
     layout: WorkbenchLayout;
     currentLayout: WorkbenchLayout;
@@ -1674,9 +2245,11 @@ function WorkbenchPanel({
     references: ReferenceImage[];
     config: AiConfig;
     model: string;
+    batchMode: boolean;
     canGenerate: boolean;
     pendingCount: number;
     updateConfig: UpdateAiConfig;
+    onBatchModeChange: (value: boolean) => void;
     openConfigDialog: (shouldPromptContinue?: boolean) => void;
     onLayoutChange: (layout: WorkbenchLayout) => void;
     onToggleSection: (section: CollapsibleSectionKey) => void;
@@ -1688,13 +2261,61 @@ function WorkbenchPanel({
     onClearPrompt: () => void;
     onPasteReferences: () => void;
     onUploadReferences: () => void;
+    onImportPackageFolder: () => void;
     onRemoveReference: (id: string) => void;
     onGenerate: () => void;
+    bottomCollapsed?: boolean;
+    onBottomCollapsedChange?: (collapsed: boolean) => void;
 }) {
+    const quickAspect = imageAspectValue(config.size || "auto");
+    const quickResolution = imageResolutionValue(config.size || "auto");
+    const updateQuickAspect = (value: string) => updateConfig("size", value === "auto" ? "auto" : resolveImageSizeForResolution(value, quickResolution));
+    const updateQuickResolution = (value: string) => updateConfig("size", resolveImageSizeForResolution(quickAspect === "auto" ? "1:1" : quickAspect, value));
+
     if (layout === "bottom") {
+        const toggleBottomCollapsed = (collapsed: boolean) => onBottomCollapsedChange?.(collapsed);
+        if (bottomCollapsed) {
+            return (
+                <div className="pointer-events-none fixed inset-x-0 bottom-5 z-40 flex justify-center px-5 sm:bottom-7 sm:px-10 lg:px-16">
+                    <div className="pointer-events-auto flex w-full max-w-3xl items-center justify-between gap-3 rounded-2xl border border-stone-200 bg-white/78 px-3 py-2 shadow-[0_18px_70px_rgba(15,23,42,.22),0_6px_18px_rgba(15,23,42,.10)] backdrop-blur-2xl dark:border-stone-800 dark:bg-stone-950/72 dark:shadow-[0_24px_80px_rgba(0,0,0,.55)]">
+                        <button
+                            type="button"
+                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl border border-stone-200 bg-white text-stone-700 transition hover:border-sky-300 hover:text-sky-500 dark:border-stone-800 dark:bg-stone-900 dark:text-stone-200"
+                            title="展开工作台"
+                            onClick={() => toggleBottomCollapsed(false)}
+                        >
+                            <ChevronUp className="size-4" />
+                        </button>
+                        <button type="button" className="min-w-0 flex-1 text-left" onClick={() => toggleBottomCollapsed(false)}>
+                            <div className="truncate text-sm font-semibold text-stone-950 dark:text-stone-100">{prompt.trim() || "生图工作台"}</div>
+                            <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
+                                <span>{references.length ? `${references.length} 张参考图` : "暂无参考图"}</span>
+                                <span>{imageSizeLabel(config.size || "auto")}</span>
+                                {pendingCount ? <span>{pendingCount} 生成中</span> : null}
+                            </div>
+                        </button>
+                        <div className="flex shrink-0 items-center gap-2">
+                            <Button title="上传参考图" icon={<Upload className="size-4" />} onClick={onUploadReferences} />
+                            <Button title="导入套图文件夹" icon={<FileArchive className="size-4" />} onClick={onImportPackageFolder} />
+                            <Button type="primary" className="rounded-xl" icon={<Sparkles className="size-4" />} disabled={!canGenerate} onClick={onGenerate}>
+                                {pendingCount ? "生成中" : "开始"}
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
         return (
             <div className="pointer-events-none fixed inset-x-0 bottom-5 z-40 flex justify-center px-5 sm:bottom-7 sm:px-10 lg:px-16">
-                <div className="pointer-events-auto w-full max-w-5xl rounded-[24px] bg-white/65 p-4 shadow-[0_32px_100px_rgba(15,23,42,.22),0_10px_34px_rgba(15,23,42,.10)] ring-1 ring-white/50 backdrop-blur-2xl dark:bg-stone-950/60 dark:ring-white/10 dark:shadow-[0_34px_110px_rgba(0,0,0,.58)]">
+                <div className="pointer-events-auto relative w-full max-w-5xl rounded-[24px] bg-white/65 p-4 shadow-[0_32px_100px_rgba(15,23,42,.22),0_10px_34px_rgba(15,23,42,.10)] ring-1 ring-white/50 backdrop-blur-2xl dark:bg-stone-950/60 dark:ring-white/10 dark:shadow-[0_34px_110px_rgba(0,0,0,.58)]">
+                    <button
+                        type="button"
+                        className="absolute left-1/2 top-0 z-10 inline-flex h-8 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-stone-200 bg-white/95 text-stone-600 shadow-lg transition hover:border-sky-300 hover:text-sky-500 dark:border-stone-800 dark:bg-stone-900/95 dark:text-stone-200"
+                        title="隐藏工作台"
+                        onClick={() => toggleBottomCollapsed(true)}
+                    >
+                        <ChevronDown className="size-4" />
+                    </button>
                     <div className="flex flex-col gap-3">
                         <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
                             <PromptMentionsInput
@@ -1712,14 +2333,15 @@ function WorkbenchPanel({
                                 <Button title="清空输入" icon={<Trash2 className="size-4" />} onClick={onClearPrompt} />
                                 {promptLibraryEnabled ? <Button title="提示词库" icon={<BookOpen className="size-4" />} onClick={onOpenPromptLibrary} /> : null}
                                 <Button title="我的素材" icon={<FolderPlus className="size-4" />} onClick={onOpenAssetPicker} />
+                                <Button title="导入套图文件夹" icon={<FileArchive className="size-4" />} onClick={onImportPackageFolder} />
                                 <Button title="切换到侧边工作台" icon={<PanelLeft className="size-4" />} onClick={() => onLayoutChange("side")} />
                             </div>
                         </div>
                         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-[1.15fr_1fr_1fr_0.95fr_0.9fr_0.9fr_auto_auto]">
-                            <QuickSelect label="尺寸" value={config.size || "auto"} options={quickSizeOptions} onChange={(value) => updateConfig("size", value)} />
-                            <QuickSelect label="质量" value={config.quality || "auto"} options={quickQualityOptions} onChange={(value) => updateConfig("quality", value)} />
+                            <QuickSelect label="尺寸" value={quickAspect} options={quickSizeOptions} onChange={updateQuickAspect} />
+                            <QuickSelect label="分辨率" value={quickResolution} options={quickResolutionOptions} onChange={updateQuickResolution} />
                             <QuickSelect label="格式" value={config.outputFormat || "png"} options={quickFormatOptions} onChange={(value) => updateConfig("outputFormat", value as AiConfig["outputFormat"])} />
-                            <QuickNumber label="压缩" value={config.outputCompression || "100"} min={0} max={100} disabled={(config.outputFormat || "png") === "png"} onChange={(value) => updateConfig("outputCompression", value)} />
+                            <QuickBatchToggle checked={batchMode} referenceCount={references.length} count={Math.max(1, Math.min(10, Number(config.count) || 1))} onChange={onBatchModeChange} />
                             <QuickSelect label="审核" value={config.moderation || "auto"} options={quickModerationOptions} onChange={(value) => updateConfig("moderation", value as AiConfig["moderation"])} />
                             <QuickNumber label="数量" value={config.count || "1"} min={1} max={10} onChange={(value) => updateConfig("count", value)} />
                             <ReferenceQuickActions references={references} onUploadReferences={onUploadReferences} />
@@ -1756,6 +2378,9 @@ function WorkbenchPanel({
                             ) : null}
                             <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={onOpenAssetPicker}>
                                 查看我的素材
+                            </Button>
+                            <Button size="small" icon={<FileArchive className="size-3.5" />} onClick={onImportPackageFolder}>
+                                导入套图文件夹
                             </Button>
                         </div>
                         <PromptMentionsInput
@@ -1852,10 +2477,10 @@ function ReferenceStrip({ references, compact = false, className = "", onRemoveR
         >
             {references.map((item, index) => (
                 <div key={item.id} className={`${compact ? "size-12" : "size-20"} group relative shrink-0 overflow-hidden rounded-md border border-stone-200 dark:border-stone-800`}>
-                    <img src={item.dataUrl} alt={item.name} className="size-full object-cover" />
+                    <Image src={item.dataUrl} alt={item.name} preview={{ mask: null }} wrapperStyle={fullImageWrapperStyle} style={thumbnailImageCoverStyle} />
                     <div className="absolute bottom-1 left-1 rounded bg-black/65 px-1 py-0.5 text-[10px] leading-none text-white">{referenceAlias(index)}</div>
                     {onRemoveReference ? (
-                        <button type="button" className="absolute right-1 top-1 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => onRemoveReference(item.id)} aria-label="移除参考图">
+                        <button type="button" className="absolute right-1 top-1 z-20 hidden size-6 items-center justify-center rounded bg-black/60 text-white group-hover:flex" onClick={() => onRemoveReference(item.id)} aria-label="移除参考图">
                             <Trash2 className="size-3.5" />
                         </button>
                     ) : null}
@@ -1942,6 +2567,111 @@ function extractClipboardImageFiles(event: ReactClipboardEvent<HTMLTextAreaEleme
     return itemFiles.length ? itemFiles : Array.from(event.clipboardData.files || []).filter((file) => file.type.startsWith("image/"));
 }
 
+function parseFolderPackageFiles(files: File[]): ParsedFolderPackage {
+    if (!files.length) throw new Error("请选择一个套图参考文件夹");
+    const imageFiles = files.filter(isImageFile);
+    if (!imageFiles.length) throw new Error("文件夹里没有可用图片");
+    const rootedFiles = imageFiles
+        .map((file) => ({
+            file,
+            parts: fileRelativePath(file)
+                .split(/[\\/]+/)
+                .filter(Boolean),
+        }))
+        .filter((item) => item.parts.length >= 2);
+    if (!rootedFiles.length) throw new Error("请选择文件夹，不要只选择散图");
+    const rootName = rootedFiles[0]?.parts[0] || "套图参考";
+    const rootImages = rootedFiles.filter((item) => item.parts.length === 2);
+    if (!rootImages.length) throw new Error("请在总文件夹根目录放入透明图");
+    const transparent = rootImages.find((item) => /透明|透图|产品|主体/i.test(item.parts[item.parts.length - 1])) || rootImages[0];
+    const items = rootedFiles
+        .filter((item) => item.parts.length >= 3 && item.file !== transparent.file)
+        .map((item) => {
+            const folderName = item.parts[1] || "其他参考";
+            return {
+                file: item.file,
+                group: resolveFolderPackageGroup(folderName),
+                folderName,
+                fileName: item.parts[item.parts.length - 1] || item.file.name,
+            };
+        })
+        .sort(sortParsedFolderPackageItems);
+    if (!items.length) throw new Error("请在参考子文件夹中放入图片，例如：参考主图、参考详情图、参考SKU");
+    return { rootName, transparentFile: transparent.file, items, skippedCount: files.length - imageFiles.length };
+}
+
+function isImageFile(file: File) {
+    return file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(file.name);
+}
+
+function fileRelativePath(file: File) {
+    return file.webkitRelativePath || file.name;
+}
+
+function resolveFolderPackageGroup(folderName: string): ProductPackageGroup {
+    const text = folderName.toLowerCase();
+    if (/主图|main/.test(text)) return "main";
+    if (/副图|sub/.test(text)) return "sub";
+    if (/详情|detail/.test(text)) return "detail";
+    if (/sku|规格|款式|变体/.test(text)) return "sku";
+    return "other";
+}
+
+function sortParsedFolderPackageItems(a: ParsedFolderPackageItem, b: ParsedFolderPackageItem) {
+    const groupDiff = packageGroupOrder.indexOf(a.group) - packageGroupOrder.indexOf(b.group);
+    if (groupDiff) return groupDiff;
+    const folderDiff = a.folderName.localeCompare(b.folderName, "zh-CN", { numeric: true });
+    if (folderDiff) return folderDiff;
+    return a.fileName.localeCompare(b.fileName, "zh-CN", { numeric: true });
+}
+
+function folderPackageGroupCounts(items: ParsedFolderPackageItem[]) {
+    return packageGroupOrder.reduce(
+        (counts, group) => {
+            counts[group] = items.filter((item) => item.group === group).length;
+            return counts;
+        },
+        { main: 0, sub: 0, detail: 0, sku: 0, other: 0 } as Record<ProductPackageGroup, number>,
+    );
+}
+
+async function uploadReferenceFile(file: File, folderName?: string): Promise<ReferenceImage> {
+    const image = await uploadImage(file);
+    return {
+        id: nanoid(),
+        name: folderName ? `${folderName}/${file.name}` : file.name,
+        type: image.mimeType,
+        dataUrl: image.url,
+        storageKey: image.storageKey,
+        width: image.width,
+        height: image.height,
+        bytes: image.bytes,
+        source: "upload",
+        temporary: true,
+    };
+}
+
+function packageItemRequestConfig(baseConfig: AiConfig, model: string, itemConfig: GenerationLogConfig): AiConfig {
+    return {
+        ...baseConfig,
+        model,
+        imageModel: model,
+        activeChannelId: baseConfig.imageChannelId,
+        count: "1",
+        quality: itemConfig.quality || baseConfig.quality,
+        size: itemConfig.size || baseConfig.size,
+        apiMode: itemConfig.apiMode || baseConfig.apiMode,
+        outputFormat: itemConfig.outputFormat || baseConfig.outputFormat,
+        outputCompression: itemConfig.outputCompression || baseConfig.outputCompression,
+        moderation: itemConfig.moderation || baseConfig.moderation,
+        timeout: itemConfig.timeout || baseConfig.timeout,
+        streamImages: typeof itemConfig.streamImages === "boolean" ? itemConfig.streamImages : baseConfig.streamImages,
+        streamPartialImages: itemConfig.streamPartialImages || baseConfig.streamPartialImages,
+        responseFormatB64Json: typeof itemConfig.responseFormatB64Json === "boolean" ? itemConfig.responseFormatB64Json : baseConfig.responseFormatB64Json,
+        codexCli: typeof itemConfig.codexCli === "boolean" ? itemConfig.codexCli : baseConfig.codexCli,
+    };
+}
+
 function referenceAlias(index: number) {
     return `图片${index + 1}`;
 }
@@ -1967,7 +2697,11 @@ function resolvePromptReferences(promptText: string, referenceItems: ReferenceIm
     }
 
     return {
-        requestText: promptText.replace(mentionPattern, "").replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim(),
+        requestText: promptText
+            .replace(mentionPattern, "")
+            .replace(/[ \t]{2,}/g, " ")
+            .replace(/\n{3,}/g, "\n\n")
+            .trim(),
         references: pickedReferences,
     };
 }
@@ -2026,11 +2760,38 @@ function QuickNumber({ label, value, min, max, disabled, onChange }: { label: st
     );
 }
 
+function QuickBatchToggle({ checked, referenceCount, count, onChange }: { checked: boolean; referenceCount: number; count: number; onChange: (value: boolean) => void }) {
+    const active = checked && referenceCount > 1;
+    const summary = active ? `${referenceCount} 图 × ${count} 张 = ${referenceCount * count} 结果` : checked ? "待多图" : "关闭";
+    const title = active ? `批量模式：${summary}，每张图跟随自身宽高比` : checked ? "批量模式已开，上传多张参考图后会拆成独立任务并跟随参考图比例" : "批量模式关闭";
+
+    return (
+        <label className="grid gap-1 text-xs text-stone-500 dark:text-stone-400">
+            批量
+            <button
+                type="button"
+                aria-pressed={checked}
+                title={title}
+                className={cn(
+                    "flex h-11 min-w-0 items-center gap-2 rounded-xl border px-3 text-left text-sm outline-none transition",
+                    checked ? "border-sky-300 bg-sky-50 text-sky-800 dark:border-sky-700 dark:bg-sky-950/40 dark:text-sky-100" : "border-stone-200 bg-background text-stone-900 dark:border-stone-800 dark:text-stone-100",
+                )}
+                onClick={() => onChange(!checked)}
+            >
+                <span className={cn("flex size-5 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold", checked ? "bg-sky-600 text-white" : "bg-stone-200 text-stone-600 dark:bg-stone-800 dark:text-stone-300")}>
+                    {checked ? "开" : "关"}
+                </span>
+                <span className="min-w-0 truncate">{summary}</span>
+            </button>
+        </label>
+    );
+}
+
 function settingsSummary(config: AiConfig, model: string) {
     return [
         model,
         imageSizeLabel(config.size || "auto"),
-        imageQualityLabel(config.quality || "auto"),
+        imageResolutionLabel(config.size || "auto"),
         imageFormatLabel(config.outputFormat || "png"),
         `压缩 ${config.outputCompression || "100"}`,
         `审核 ${config.moderation || "auto"}`,
@@ -2066,25 +2827,21 @@ function PackageQuickStartModal({
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     return (
-        <Modal
-            title="小白图包 Demo"
-            open={open}
-            width={880}
-            onCancel={onCancel}
-            onOk={onSubmit}
-            okText="开始并跳到结果页"
-            cancelText="取消"
-            okButtonProps={{ disabled: !draft.productName.trim() }}
-            destroyOnHidden={false}
-        >
+        <Modal title="小白图包 Demo" open={open} width={880} onCancel={onCancel} onOk={onSubmit} okText="开始并跳到结果页" cancelText="取消" okButtonProps={{ disabled: !draft.productName.trim() }} destroyOnHidden={false}>
             <div className="space-y-4">
                 <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-sm text-sky-950 dark:border-sky-900/60 dark:bg-sky-950/30 dark:text-sky-100">
                     <div className="font-medium">这个 Demo 先看流程，不改你现在的主逻辑。</div>
                     <div className="mt-1 text-xs text-sky-800 dark:text-sky-200">填好信息后，会直接创建一个图包文件夹，然后跳到结果页，里面按主图 / 副图 / 详情图拆好 16 张。</div>
                     <div className="mt-2 flex flex-wrap gap-1.5">
-                        <Tag className="m-0" color="blue">主图 1</Tag>
-                        <Tag className="m-0" color="cyan">副图 4</Tag>
-                        <Tag className="m-0" color="purple">详情图 11</Tag>
+                        <Tag className="m-0" color="blue">
+                            主图 1
+                        </Tag>
+                        <Tag className="m-0" color="cyan">
+                            副图 4
+                        </Tag>
+                        <Tag className="m-0" color="purple">
+                            详情图 11
+                        </Tag>
                     </div>
                 </div>
                 <div className="grid gap-3 md:grid-cols-2">
@@ -2165,9 +2922,12 @@ function ResultsPanel({
     now,
     selectedLogIds,
     selectedPackageIds,
+    selectedResultIds,
     activeLogId,
+    linkingImageId,
     onSelectedLogIdsChange,
     onSelectedPackageIdsChange,
+    onSelectedResultIdsChange,
     onResultViewModeChange,
     onActiveCategoryChange,
     onOpenPackage,
@@ -2179,6 +2939,7 @@ function ResultsPanel({
     onClearLogCategories,
     onDeleteSelected,
     onDeleteLog,
+    onDeleteResult,
     onPreviewLog,
     onRetryLog,
     onCopyPrompt,
@@ -2186,9 +2947,14 @@ function ResultsPanel({
     onUpdateResultPrompt,
     onUpdatePackageItemPrompt,
     onRetryPackageItem,
+    onTogglePackageItemSelected,
+    onSelectPackageItems,
+    onStartSelectedPackageItems,
+    onImportPackageFolder,
     onEdit,
     onDownload,
     onDownloadPackageItem,
+    onCopyImageLink,
     onSaveAsset,
     onRetry,
 }: {
@@ -2204,9 +2970,12 @@ function ResultsPanel({
     now: number;
     selectedLogIds: string[];
     selectedPackageIds: string[];
+    selectedResultIds: string[];
     activeLogId?: string;
+    linkingImageId: string;
     onSelectedLogIdsChange: (ids: string[]) => void;
     onSelectedPackageIdsChange: (ids: string[]) => void;
+    onSelectedResultIdsChange: (ids: string[]) => void;
     onResultViewModeChange: (mode: ResultViewMode) => void;
     onActiveCategoryChange: (id: string | null) => void;
     onOpenPackage: (id: string) => void;
@@ -2218,65 +2987,87 @@ function ResultsPanel({
     onClearLogCategories: (log: GenerationLog) => void;
     onDeleteSelected: () => void;
     onDeleteLog: (log: GenerationLog) => void;
+    onDeleteResult: (result: GenerationResult) => void;
     onPreviewLog: (log: GenerationLog) => void;
     onRetryLog: (log: GenerationLog) => void;
     onCopyPrompt: (text: string) => void | Promise<void>;
     onUpdateLogPrompt: (log: GenerationLog, prompt: string) => boolean | Promise<boolean>;
     onUpdateResultPrompt: (resultId: string, prompt: string) => boolean;
-    onUpdatePackageItemPrompt: (packageId: string, itemId: string, prompt: string) => void | Promise<void>;
-    onRetryPackageItem: (packageId: string, itemId: string) => void | Promise<void>;
+    onUpdatePackageItemPrompt: (packageId: string, itemId: string, prompt: string, options?: { silent?: boolean; allowEmpty?: boolean }) => void | Promise<void>;
+    onRetryPackageItem: (packageId: string, itemId: string, promptOverride?: string) => void | Promise<void>;
+    onTogglePackageItemSelected: (packageId: string, itemId: string, checked: boolean) => void;
+    onSelectPackageItems: (packageId: string, group: ProductPackageGroup | "all", checked: boolean) => void;
+    onStartSelectedPackageItems: (packageId: string, group?: ProductPackageGroup | "all", promptOverride?: string) => void | Promise<void>;
+    onImportPackageFolder: () => void;
     onEdit: (image: GeneratedImage, index: number) => void;
     onDownload: (image: GeneratedImage, index: number) => void;
     onDownloadPackageItem: (item: ProductPackageItem) => void;
+    onCopyImageLink: (image: GeneratedImage, index: number) => void | Promise<void>;
     onSaveAsset: (image: GeneratedImage, index: number) => void;
     onRetry: (result: GenerationResult) => void;
 }) {
     const packageLogIds = new Set(productPackages.flatMap((pkg) => pkg.items.map((item) => item.logId).filter((id): id is string => Boolean(id))));
-    const baseVisibleLogs = logs.filter((log) => !packageLogIds.has(log.id));
     const allLogIds = new Set(logs.map((log) => log.id));
-    const standaloneResults = results.filter((result) => !result.logId || !allLogIds.has(result.logId));
+    const baseVisibleLogs = logs.filter((log) => !packageLogIds.has(log.id));
+    const baseLogVersionGroups = buildLogVersionGroups(baseVisibleLogs);
+    const anchoredRetryResults = results.filter((result) => (result.status === "waiting" || result.status === "running") && (result.versionGroupId || (result.logId && allLogIds.has(result.logId))));
+    const anchoredRetryResultIds = new Set(anchoredRetryResults.map((result) => result.id));
+    const retryResultByVersionGroup = new Map<string, GenerationResult>();
+    anchoredRetryResults.forEach((result) => retryResultByVersionGroup.set(resolveResultVersionGroupId(result), result));
+    const standaloneResults = results.filter((result) => !anchoredRetryResultIds.has(result.id) && (!result.logId || !allLogIds.has(result.logId)));
     const visiblePackages = resultViewMode === "all" ? productPackages : [];
-    const categoryGroups = categories.map((category) => ({ category, logs: baseVisibleLogs.filter((log) => log.categoryIds.includes(category.id)) }));
+    const categoryGroups = categories.map((category) => ({ category, logs: latestLogsByVersionGroup(baseVisibleLogs.filter((log) => log.categoryIds.includes(category.id))) }));
     const activeCategory = activeCategoryId ? categories.find((category) => category.id === activeCategoryId) : null;
     const activePackage = activePackageId ? productPackages.find((item) => item.id === activePackageId) || null : null;
-    const visibleLogs = resultViewMode === "category" ? (activeCategoryId ? baseVisibleLogs.filter((log) => log.categoryIds.includes(activeCategoryId)) : baseVisibleLogs.filter((log) => !log.categoryIds.length)) : baseVisibleLogs;
+    const rawVisibleLogs = resultViewMode === "category" ? (activeCategoryId ? baseVisibleLogs.filter((log) => log.categoryIds.includes(activeCategoryId)) : baseVisibleLogs.filter((log) => !log.categoryIds.length)) : baseVisibleLogs;
+    const visibleLogs = latestLogsByVersionGroup(rawVisibleLogs);
     const visiblePackageCount = visiblePackages.length;
-    const totalCount = activePackage
-        ? activePackage.items.length
-        : visiblePackageCount + standaloneResults.length + (resultViewMode === "category" ? (activeCategoryId ? visibleLogs.length : categories.length + visibleLogs.length) : visibleLogs.length);
+    const totalCount = activePackage ? activePackage.items.length : visiblePackageCount + standaloneResults.length + (resultViewMode === "category" ? (activeCategoryId ? visibleLogs.length : categories.length + visibleLogs.length) : visibleLogs.length);
     const shouldShowGrid = totalCount > 0;
+    const allVisibleResultsSelected = Boolean(standaloneResults.length) && standaloneResults.every((result) => selectedResultIds.includes(result.id));
     const allVisibleLogsSelected = Boolean(visibleLogs.length) && visibleLogs.every((log) => selectedLogIds.includes(log.id));
     const allVisiblePackagesSelected = Boolean(visiblePackages.length) && visiblePackages.every((pkg) => selectedPackageIds.includes(pkg.id));
-    const hasSelectableItems = Boolean(visibleLogs.length || visiblePackages.length);
-    const allVisibleItemsSelected = hasSelectableItems && (!visibleLogs.length || allVisibleLogsSelected) && (!visiblePackages.length || allVisiblePackagesSelected);
+    const hasSelectableItems = Boolean(standaloneResults.length || visibleLogs.length || visiblePackages.length);
+    const allVisibleItemsSelected = hasSelectableItems && (!standaloneResults.length || allVisibleResultsSelected) && (!visibleLogs.length || allVisibleLogsSelected) && (!visiblePackages.length || allVisiblePackagesSelected);
     const toggleVisibleItems = () => {
         if (allVisibleItemsSelected) {
+            onSelectedResultIdsChange(selectedResultIds.filter((id) => !standaloneResults.some((result) => result.id === id)));
             onSelectedLogIdsChange(selectedLogIds.filter((id) => !visibleLogs.some((log) => log.id === id)));
             onSelectedPackageIdsChange(selectedPackageIds.filter((id) => !visiblePackages.some((pkg) => pkg.id === id)));
             return;
         }
+        onSelectedResultIdsChange(Array.from(new Set([...selectedResultIds, ...standaloneResults.map((result) => result.id)])));
         onSelectedLogIdsChange(Array.from(new Set([...selectedLogIds, ...visibleLogs.map((log) => log.id)])));
         onSelectedPackageIdsChange(Array.from(new Set([...selectedPackageIds, ...visiblePackages.map((pkg) => pkg.id)])));
     };
-    const renderResultCard = (result: GenerationResult, index: number) =>
-        result.status === "success" && result.image ? (
+    const renderResultCard = (result: GenerationResult, index: number) => {
+        const selected = selectedResultIds.includes(result.id);
+        const onSelectedChange = (checked: boolean) => onSelectedResultIdsChange(checked ? Array.from(new Set([...selectedResultIds, result.id])) : selectedResultIds.filter((id) => id !== result.id));
+        const onDelete = () => onDeleteResult(result);
+        return result.status === "success" && result.image ? (
             <ResultImageCard
                 key={result.id}
                 result={result}
                 image={result.image}
                 index={index}
+                selected={selected}
+                onSelectedChange={onSelectedChange}
+                onDelete={onDelete}
                 onCopyPrompt={onCopyPrompt}
                 onUpdatePrompt={onUpdateResultPrompt}
                 onRetry={() => onRetry(result)}
                 onEdit={onEdit}
                 onDownload={onDownload}
+                onCopyLink={onCopyImageLink}
                 onSaveAsset={onSaveAsset}
+                linking={linkingImageId === result.image.id}
             />
         ) : result.status === "failed" ? (
-            <FailedImageCard key={result.id} result={result} error={result.error || "生成失败"} onCopyPrompt={onCopyPrompt} onRetry={() => onRetry(result)} />
+            <FailedImageCard key={result.id} result={result} error={result.error || "生成失败"} selected={selected} onSelectedChange={onSelectedChange} onDelete={onDelete} onCopyPrompt={onCopyPrompt} onRetry={() => onRetry(result)} />
         ) : (
-            <PendingImageCard key={result.id} result={result} now={now} onCopyPrompt={onCopyPrompt} />
+            <PendingImageCard key={result.id} result={result} now={now} selected={selected} onSelectedChange={onSelectedChange} onDelete={onDelete} onCopyPrompt={onCopyPrompt} />
         );
+    };
 
     useEffect(() => {
         if (activeCategoryId && !categories.some((category) => category.id === activeCategoryId)) onActiveCategoryChange(null);
@@ -2287,12 +3078,21 @@ function ResultsPanel({
             <PackageResultsPanel
                 className={className}
                 packageData={activePackage}
+                logs={logs}
                 now={now}
                 onBack={onClosePackage}
                 onCopyPrompt={onCopyPrompt}
-                onUpdatePrompt={(itemId, prompt) => onUpdatePackageItemPrompt(activePackage.id, itemId, prompt)}
-                onRetryItem={(itemId) => onRetryPackageItem(activePackage.id, itemId)}
+                onPreviewLog={onPreviewLog}
+                onUpdatePrompt={(itemId, prompt, options) => onUpdatePackageItemPrompt(activePackage.id, itemId, prompt, options)}
+                onRetryItem={(itemId, promptOverride) => onRetryPackageItem(activePackage.id, itemId, promptOverride)}
+                onToggleItemSelected={(itemId, checked) => onTogglePackageItemSelected(activePackage.id, itemId, checked)}
+                onSelectItems={(group, checked) => onSelectPackageItems(activePackage.id, group, checked)}
+                onStartSelected={(group, promptOverride) => onStartSelectedPackageItems(activePackage.id, group, promptOverride)}
+                onImportPackageFolder={onImportPackageFolder}
                 onDownloadPackageItem={onDownloadPackageItem}
+                onDownloadImage={onDownload}
+                linkingImageId={linkingImageId}
+                onCopyImageLink={onCopyImageLink}
                 onSaveAsset={onSaveAsset}
                 onEdit={onEdit}
             />
@@ -2332,7 +3132,7 @@ function ResultsPanel({
                     <Button size="small" icon={<CheckSquare className="size-3.5" />} disabled={!hasSelectableItems} onClick={toggleVisibleItems}>
                         {allVisibleItemsSelected ? "取消" : "全选"}
                     </Button>
-                    <Button size="small" danger icon={<Trash2 className="size-3.5" />} disabled={!selectedLogIds.length && !selectedPackageIds.length} onClick={onDeleteSelected}>
+                    <Button size="small" danger icon={<Trash2 className="size-3.5" />} disabled={!selectedResultIds.length && !selectedLogIds.length && !selectedPackageIds.length} onClick={onDeleteSelected}>
                         删除
                     </Button>
                 </div>
@@ -2345,9 +3145,7 @@ function ResultsPanel({
                                   key={packageData.id}
                                   packageData={packageData}
                                   selected={selectedPackageIds.includes(packageData.id)}
-                                  onSelectedChange={(checked) =>
-                                      onSelectedPackageIdsChange(checked ? [...selectedPackageIds, packageData.id] : selectedPackageIds.filter((id) => id !== packageData.id))
-                                  }
+                                  onSelectedChange={(checked) => onSelectedPackageIdsChange(checked ? [...selectedPackageIds, packageData.id] : selectedPackageIds.filter((id) => id !== packageData.id))}
                                   onOpen={() => onOpenPackage(packageData.id)}
                               />
                           ))
@@ -2363,10 +3161,14 @@ function ResultsPanel({
                         </>
                     ) : null}
                     {visibleLogs.map((log, index) => {
+                        const groupId = resolveLogVersionGroupId(log);
+                        const retryResult = retryResultByVersionGroup.get(groupId);
+                        if (retryResult) return renderResultCard(retryResult, index);
                         return (
                             <HistoryLogCard
                                 key={log.id}
                                 log={log}
+                                historyLogs={baseLogVersionGroups.get(groupId) || [log]}
                                 categories={categories}
                                 index={index}
                                 selected={selectedLogIds.includes(log.id)}
@@ -2378,11 +3180,15 @@ function ResultsPanel({
                                 onCreateCategory={onCreateCategory}
                                 onPreview={() => onPreviewLog(log)}
                                 onRetry={() => onRetryLog(log)}
+                                onPreviewHistoryLog={onPreviewLog}
+                                onRetryHistoryLog={onRetryLog}
                                 onUpdatePrompt={(promptText) => onUpdateLogPrompt(log, promptText)}
                                 onCopyPrompt={onCopyPrompt}
                                 onEdit={onEdit}
                                 onDownload={onDownload}
+                                onCopyLink={onCopyImageLink}
                                 onSaveAsset={onSaveAsset}
+                                linkingImageId={linkingImageId}
                             />
                         );
                     })}
@@ -2465,43 +3271,24 @@ function CategoryCard({
     );
 }
 
-function ProductPackageFolderCard({
-    packageData,
-    selected,
-    onSelectedChange,
-    onOpen,
-}: {
-    packageData: ProductImagePackage;
-    selected: boolean;
-    onSelectedChange: (checked: boolean) => void;
-    onOpen: () => void;
-}) {
+function ProductPackageFolderCard({ packageData, selected, onSelectedChange, onOpen }: { packageData: ProductImagePackage; selected: boolean; onSelectedChange: (checked: boolean) => void; onOpen: () => void }) {
     const stats = getVisiblePackageStats(packageData);
-    const mainCoverUrl =
-        packageData.items.find((item) => item.group === "main" && item.image?.dataUrl)?.image?.dataUrl ||
-        packageData.items.find((item) => item.image?.dataUrl)?.image?.dataUrl ||
-        packageData.references[0]?.dataUrl ||
-        null;
+    const mainCoverUrl = packageData.items.find((item) => item.group === "main" && item.image?.dataUrl)?.image?.dataUrl || packageData.items.find((item) => item.image?.dataUrl)?.image?.dataUrl || packageData.references[0]?.dataUrl || null;
     const visibleGroupCounts = getVisiblePackageGroupCounts(packageData);
-    const mainDone = packageData.items.filter((item) => item.group === "main" && shouldDisplayPackageItem(item) && item.status === "success").length;
-    const subDone = packageData.items.filter((item) => item.group === "sub" && shouldDisplayPackageItem(item) && item.status === "success").length;
-    const detailDone = packageData.items.filter((item) => item.group === "detail" && shouldDisplayPackageItem(item) && item.status === "success").length;
+    const groupDoneCounts = packageGroupOrder.reduce(
+        (counts, group) => {
+            counts[group] = packageData.items.filter((item) => item.group === group && shouldDisplayPackageItem(item) && item.status === "success").length;
+            return counts;
+        },
+        { main: 0, sub: 0, detail: 0, sku: 0, other: 0 } as Record<ProductPackageGroup, number>,
+    );
     return (
         <div className="group relative min-h-[360px] overflow-hidden rounded-lg border border-stone-200 bg-stone-100/60 dark:border-stone-800 dark:bg-stone-900/60 sm:min-h-[420px]">
-            <button
-                type="button"
-                className="absolute inset-0 z-10 text-left transition hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-xl dark:hover:border-sky-500/50"
-                onClick={onOpen}
-                aria-label={`打开图包 ${packageData.packageName}`}
-            />
+            <button type="button" className="absolute inset-0 z-10 text-left transition hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-xl dark:hover:border-sky-500/50" onClick={onOpen} aria-label={`打开图包 ${packageData.packageName}`} />
             <div className="pointer-events-none absolute inset-0 overflow-hidden">
                 {mainCoverUrl ? (
                     <div className="absolute inset-0 flex items-center justify-center p-4">
-                        <img
-                            src={mainCoverUrl}
-                            alt=""
-                            className="max-h-[78%] max-w-[84%] rounded-lg border border-white/85 object-contain shadow-xl transition-transform duration-200 group-hover:scale-[1.02] dark:border-stone-950"
-                        />
+                        <img src={mainCoverUrl} alt="" className="max-h-[78%] max-w-[84%] rounded-lg border border-white/85 object-contain shadow-xl transition-transform duration-200 group-hover:scale-[1.02] dark:border-stone-950" />
                     </div>
                 ) : (
                     <div className="flex size-full flex-col items-center justify-center gap-3 text-stone-400">
@@ -2519,9 +3306,13 @@ function ProductPackageFolderCard({
                     <div className="h-full rounded-full bg-sky-300 transition-all" style={{ width: `${stats.percent}%` }} />
                 </div>
                 <div className="flex flex-wrap gap-1.5 text-[10px]">
-                    {visibleGroupCounts.main ? <span className="rounded bg-white/15 px-1.5 py-0.5">主图 {mainDone}/{visibleGroupCounts.main}</span> : null}
-                    {visibleGroupCounts.sub ? <span className="rounded bg-white/15 px-1.5 py-0.5">副图 {subDone}/{visibleGroupCounts.sub}</span> : null}
-                    {visibleGroupCounts.detail ? <span className="rounded bg-white/15 px-1.5 py-0.5">详情 {detailDone}/{visibleGroupCounts.detail}</span> : null}
+                    {packageGroupOrder.map((group) =>
+                        visibleGroupCounts[group] ? (
+                            <span key={group} className="rounded bg-white/15 px-1.5 py-0.5">
+                                {packageGroupTitle(group)} {groupDoneCounts[group]}/{visibleGroupCounts[group]}
+                            </span>
+                        ) : null,
+                    )}
                     <span className="rounded bg-white/15 px-1.5 py-0.5">{stats.running ? `${stats.running} 生成中` : `${stats.success}/${stats.total} 完成`}</span>
                 </div>
             </div>
@@ -2538,39 +3329,124 @@ function ProductPackageFolderCard({
     );
 }
 
+function ProductPackageReferenceCard({ packageData }: { packageData: ProductImagePackage }) {
+    const productReference = packageData.references[0] || packageData.items.flatMap((item) => item.references)[0];
+    const stats = getVisiblePackageStats(packageData);
+    return (
+        <section className="overflow-hidden rounded-xl border border-stone-200 bg-white shadow-sm dark:border-stone-800 dark:bg-[#141414]">
+            <div className="flex items-center justify-between border-b border-stone-200 px-3 py-2 dark:border-stone-800">
+                <div className="min-w-0">
+                    <div className="text-xs text-stone-500 dark:text-stone-400">{referenceAlias(0)} · 透明主图</div>
+                    <div className="truncate text-sm font-semibold">{packageData.productName}</div>
+                </div>
+                <Tag className="m-0">{stats.total} 张参考</Tag>
+            </div>
+            <div className="relative aspect-square bg-[linear-gradient(45deg,rgba(120,113,108,.14)_25%,transparent_25%),linear-gradient(-45deg,rgba(120,113,108,.14)_25%,transparent_25%),linear-gradient(45deg,transparent_75%,rgba(120,113,108,.14)_75%),linear-gradient(-45deg,transparent_75%,rgba(120,113,108,.14)_75%)] bg-[length:18px_18px] bg-[position:0_0,0_9px,9px_-9px,-9px_0] p-3 dark:bg-[linear-gradient(45deg,rgba(255,255,255,.08)_25%,transparent_25%),linear-gradient(-45deg,rgba(255,255,255,.08)_25%,transparent_25%),linear-gradient(45deg,transparent_75%,rgba(255,255,255,.08)_75%),linear-gradient(-45deg,transparent_75%,rgba(255,255,255,.08)_75%)]">
+                <div className="absolute left-2 top-2 z-10 rounded bg-black/65 px-1.5 py-0.5 text-[10px] font-medium text-white">{referenceAlias(0)}</div>
+                {productReference?.dataUrl ? (
+                    <Image src={productReference.dataUrl} alt={productReference.name || packageData.productName} wrapperStyle={fullImageWrapperStyle} style={fullImageContainStyle} preview={{ mask: null }} />
+                ) : (
+                    <div className="flex size-full flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-stone-300 text-sm text-stone-500 dark:border-stone-700 dark:text-stone-400">
+                        <ImagePlus className="size-7" />
+                        <span>没有透明主图</span>
+                    </div>
+                )}
+            </div>
+            <div className="space-y-1 border-t border-stone-200 p-3 text-xs text-stone-500 dark:border-stone-800 dark:text-stone-400">
+                <div className="truncate">{productReference?.name || "未命名产品图"}</div>
+                <div className="flex flex-wrap gap-1.5">
+                    {productReference?.width && productReference.height ? (
+                        <Tag className="m-0 text-[10px]">
+                            {productReference.width}x{productReference.height}
+                        </Tag>
+                    ) : null}
+                    {productReference?.bytes ? <Tag className="m-0 text-[10px]">{formatBytes(productReference.bytes)}</Tag> : null}
+                    <Tag className="m-0 text-[10px]">{packageData.model || "未配置模型"}</Tag>
+                </div>
+            </div>
+        </section>
+    );
+}
+
 function PackageResultsPanel({
     className,
     packageData,
+    logs,
     now,
     onBack,
     onCopyPrompt,
+    onPreviewLog,
     onUpdatePrompt,
     onRetryItem,
+    onToggleItemSelected,
+    onSelectItems,
+    onStartSelected,
+    onImportPackageFolder,
     onDownloadPackageItem,
+    onDownloadImage,
+    linkingImageId,
+    onCopyImageLink,
     onSaveAsset,
     onEdit,
 }: {
     className?: string;
     packageData: ProductImagePackage;
+    logs: GenerationLog[];
     now: number;
     onBack: () => void;
     onCopyPrompt: (text: string) => void | Promise<void>;
-    onUpdatePrompt: (itemId: string, prompt: string) => void | Promise<void>;
-    onRetryItem: (itemId: string) => void | Promise<void>;
+    onPreviewLog: (log: GenerationLog) => void;
+    onUpdatePrompt: (itemId: string, prompt: string, options?: { silent?: boolean; allowEmpty?: boolean }) => void | Promise<void>;
+    onRetryItem: (itemId: string, promptOverride?: string) => void | Promise<void>;
+    onToggleItemSelected: (itemId: string, checked: boolean) => void;
+    onSelectItems: (group: ProductPackageGroup | "all", checked: boolean) => void;
+    onStartSelected: (group?: ProductPackageGroup | "all", promptOverride?: string) => void | Promise<void>;
+    onImportPackageFolder: () => void;
     onDownloadPackageItem: (item: ProductPackageItem) => void;
+    onDownloadImage: (image: GeneratedImage, index: number) => void;
+    linkingImageId: string;
+    onCopyImageLink: (image: GeneratedImage, index: number) => void | Promise<void>;
     onSaveAsset: (image: GeneratedImage, index: number) => void;
     onEdit: (image: GeneratedImage, index: number) => void;
 }) {
     const { message } = App.useApp();
+    const [bulkPrompt, setBulkPrompt] = useState("");
     const stats = getVisiblePackageStats(packageData);
+    const itemHistoryMap = useMemo(() => buildPackageItemHistoryMap(logs, packageData.id), [logs, packageData.id]);
     const groups = useMemo(
         () =>
-            (["main", "sub", "detail"] as ProductPackageGroup[]).map((group) => ({
+            packageGroupOrder.map((group) => ({
                 group,
                 items: packageData.items.filter((item) => item.group === group && shouldDisplayPackageItem(item)),
             })),
         [packageData.items],
     );
+    const visibleGroups = groups.filter(({ items }) => items.length);
+    const selectableItems = packageData.items.filter((item) => shouldDisplayPackageItem(item) && item.status !== "running");
+    const selectedCount = selectableItems.filter((item) => item.selected).length;
+    const allSelectableSelected = Boolean(selectableItems.length) && selectableItems.every((item) => item.selected);
+    const selectedRunnableCount = selectableItems.filter((item) => item.selected && item.prompt.trim()).length;
+    const bulkPromptText = bulkPrompt.trim();
+    const displayRunnableCount = bulkPromptText ? selectedCount : selectedRunnableCount;
+    const selectedItemsForGroup = (group: ProductPackageGroup | "all" = "all") => selectableItems.filter((item) => item.selected && (group === "all" || item.group === group));
+    const applyBulkPromptToSelected = async (group: ProductPackageGroup | "all" = "all") => {
+        const nextPrompt = bulkPrompt.trim();
+        if (!nextPrompt) {
+            message.warning("请先输入批量提示词");
+            return false;
+        }
+        const targets = selectedItemsForGroup(group);
+        if (!targets.length) {
+            message.warning(group === "all" ? "请先勾选要应用的图片" : `请先勾选${packageGroupTitle(group)}里的图片`);
+            return false;
+        }
+        await Promise.all(targets.map((item) => Promise.resolve(onUpdatePrompt(item.id, nextPrompt, { silent: true }))));
+        message.success(`已应用到 ${targets.length} 张`);
+        return true;
+    };
+    const startSelectedWithBulkPrompt = async (group: ProductPackageGroup | "all" = "all") => {
+        await Promise.resolve(onStartSelected(group, bulkPromptText || undefined));
+    };
     const downloadPackageItems = async (items: ProductPackageItem[], fileName: string) => {
         const imageItems = items.filter((item) => item.image);
         if (!imageItems.length) {
@@ -2603,64 +3479,189 @@ function PackageResultsPanel({
         }
     };
     return (
-        <div className={`thin-scrollbar rounded-lg border border-stone-200 bg-card p-4 shadow-sm dark:border-stone-800 lg:min-h-0 lg:overflow-y-auto lg:p-5 ${className || ""}`}>
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex min-w-0 items-center gap-2">
-                    <Button size="small" icon={<ChevronLeft className="size-3.5" />} onClick={onBack}>
-                        返回
-                    </Button>
-                    <FileArchive className="size-4 text-sky-500" />
-                    <h2 className="truncate text-xl font-semibold">{packageData.packageName}</h2>
-                    <Tag className="m-0">{stats.success}/{stats.total}</Tag>
-                    {stats.running ? <Tag className="m-0" color="processing">{stats.running} 生成中</Tag> : null}
-                    {stats.failed ? <Tag className="m-0" color="red">失败 {stats.failed}</Tag> : null}
-                </div>
-                <div className="flex shrink-0 gap-2">
-                    <Button size="small" icon={<Download className="size-3.5" />} disabled={!stats.success} onClick={() => void downloadPackageItems(packageData.items, packageData.packageName)}>
-                        下载图包
-                    </Button>
+        <div className={`thin-scrollbar rounded-xl border border-stone-200 bg-card p-4 shadow-sm dark:border-stone-800 dark:bg-[#101010] lg:min-h-0 lg:overflow-y-auto lg:p-5 ${className || ""}`}>
+            <div className="sticky top-0 z-20 -mx-4 -mt-4 mb-5 border-b border-stone-200 bg-card/95 px-4 py-3 backdrop-blur dark:border-stone-800 dark:bg-[#101010]/95 lg:-mx-5 lg:-mt-5 lg:px-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-2">
+                        <Button size="small" icon={<ChevronLeft className="size-3.5" />} onClick={onBack}>
+                            返回
+                        </Button>
+                        <FileArchive className="size-4 text-sky-500" />
+                        <h2 className="truncate text-xl font-semibold">{packageData.packageName}</h2>
+                        <Tag className="m-0">
+                            {stats.success}/{stats.total}
+                        </Tag>
+                        {stats.running ? (
+                            <Tag className="m-0" color="processing">
+                                {stats.running} 生成中
+                            </Tag>
+                        ) : null}
+                        {stats.failed ? (
+                            <Tag className="m-0" color="red">
+                                失败 {stats.failed}
+                            </Tag>
+                        ) : null}
+                    </div>
+                    <div className="flex shrink-0 flex-wrap gap-2">
+                        <Button size="small" icon={<Upload className="size-3.5" />} onClick={onImportPackageFolder}>
+                            上传套图
+                        </Button>
+                        <Button size="small" icon={<CheckSquare className="size-3.5" />} disabled={!selectableItems.length} onClick={() => onSelectItems("all", !allSelectableSelected)}>
+                            {allSelectableSelected ? "取消全选" : "全部勾选"}
+                        </Button>
+                        <Button size="small" type="primary" icon={<Sparkles className="size-3.5" />} disabled={!selectedCount} onClick={() => void startSelectedWithBulkPrompt("all")}>
+                            开始生成{selectedCount ? ` ${displayRunnableCount}/${selectedCount}` : ""}
+                        </Button>
+                        <Button size="small" icon={<Download className="size-3.5" />} disabled={!stats.success} onClick={() => void downloadPackageItems(packageData.items, packageData.packageName)}>
+                            下载图包
+                        </Button>
+                    </div>
                 </div>
             </div>
-            <div className="mb-5 rounded-lg border border-stone-200 bg-stone-50 p-3 dark:border-stone-800 dark:bg-stone-900/60">
-                <div className="mb-2 flex items-center justify-between gap-3 text-xs text-stone-500 dark:text-stone-400">
-                    <span>图包进度</span>
-                    <span>{stats.percent}%</span>
-                </div>
-                <div className="h-2 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-800">
-                    <div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${stats.percent}%` }} />
+            <div className="mb-5 grid gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+                <ProductPackageReferenceCard packageData={packageData} />
+                <div className="rounded-xl border border-stone-200 bg-stone-50/75 p-3 dark:border-stone-800 dark:bg-stone-950/50">
+                    <div className="mb-3 flex items-center justify-between gap-3 text-xs text-stone-500 dark:text-stone-400">
+                        <span>图包进度</span>
+                        <span>{stats.percent}%</span>
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full bg-stone-200 dark:bg-stone-800">
+                        <div className="h-full rounded-full bg-sky-500 transition-all" style={{ width: `${stats.percent}%` }} />
+                    </div>
+                    <div className="mt-3 rounded-lg border border-stone-200 bg-white/85 p-2 dark:border-stone-800 dark:bg-[#141414]">
+                        <div className="mb-1.5 flex items-center justify-between gap-2 text-xs">
+                            <span className="font-medium text-stone-700 dark:text-stone-200">批量提示词</span>
+                            <span className="text-stone-500 dark:text-stone-400">{selectedCount ? `已勾选 ${selectedCount} 张` : "先勾选图片"}</span>
+                        </div>
+                        <Input.TextArea
+                            value={bulkPrompt}
+                            autoSize={{ minRows: 4, maxRows: 8 }}
+                            placeholder="例如：把图片1的产品替换到图片2里，保持图片2构图、背景、排版和文字风格"
+                            className="!rounded-lg !border-stone-200 !bg-stone-50/80 !py-2.5 !text-xs dark:!border-stone-800 dark:!bg-stone-950/70"
+                            onChange={(event) => setBulkPrompt(event.target.value)}
+                        />
+                        <div className="mt-2 flex flex-wrap justify-end gap-2">
+                            <Button size="small" disabled={!bulkPromptText || !selectedCount} onClick={() => void applyBulkPromptToSelected("all")}>
+                                应用到已勾选
+                            </Button>
+                            <Button size="small" type="primary" icon={<Sparkles className="size-3.5" />} disabled={!selectedCount} onClick={() => void startSelectedWithBulkPrompt("all")}>
+                                应用并开始
+                            </Button>
+                        </div>
+                    </div>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                        {visibleGroups.map(({ group, items }) => {
+                            const completedCount = items.filter((item) => item.status === "success").length;
+                            const runningCount = items.filter((item) => item.status === "running").length;
+                            const failedCount = items.filter((item) => item.status === "failed").length;
+                            const groupSelectable = items.filter((item) => item.status !== "running");
+                            const groupSelected = groupSelectable.filter((item) => item.selected).length;
+                            const allGroupSelected = Boolean(groupSelectable.length) && groupSelectable.every((item) => item.selected);
+                            return (
+                                <div key={group} className="overflow-hidden rounded-lg border border-stone-200 bg-white dark:border-stone-800 dark:bg-[#141414]">
+                                    <div className={cn("h-1", packageGroupAccentClass(group))} />
+                                    <div className="space-y-2 px-3 py-2">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <div className="flex min-w-0 items-center gap-2">
+                                                <span className={cn("size-2 rounded-full", packageGroupAccentClass(group))} />
+                                                <span className="truncate text-sm font-medium">{packageGroupSectionTitle(group)}</span>
+                                            </div>
+                                            <span className="shrink-0 text-xs text-stone-500 dark:text-stone-400">
+                                                {completedCount}/{items.length}
+                                            </span>
+                                        </div>
+                                        <div className="flex items-center justify-between gap-2">
+                                            <Checkbox checked={allGroupSelected} indeterminate={groupSelected > 0 && !allGroupSelected} disabled={!groupSelectable.length} onChange={(event) => onSelectItems(group, event.target.checked)}>
+                                                <span className="text-xs">勾选本组 {groupSelected ? `${groupSelected}/${groupSelectable.length}` : ""}</span>
+                                            </Checkbox>
+                                            <Button size="small" type="text" className="!h-6 !px-1.5 text-xs" disabled={!groupSelected} onClick={() => void startSelectedWithBulkPrompt(group)}>
+                                                生成
+                                            </Button>
+                                        </div>
+                                        <div className="flex flex-wrap gap-1.5">
+                                            {runningCount ? <span className="rounded bg-sky-500/12 px-1.5 py-0.5 text-[10px] text-sky-600 dark:text-sky-300">{runningCount} 生成中</span> : null}
+                                            {failedCount ? <span className="rounded bg-red-500/12 px-1.5 py-0.5 text-[10px] text-red-600 dark:text-red-300">失败 {failedCount}</span> : null}
+                                            {!runningCount && !failedCount ? (
+                                                groupSelected ? (
+                                                    <span className="rounded bg-sky-500/12 px-1.5 py-0.5 text-[10px] text-sky-600 dark:text-sky-300">已勾选 {groupSelected}</span>
+                                                ) : (
+                                                    <span className="rounded bg-stone-500/12 px-1.5 py-0.5 text-[10px] text-stone-500">{completedCount === items.length ? "已完成" : "等待勾选"}</span>
+                                                )
+                                            ) : null}
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
                 </div>
             </div>
             <div className="space-y-6">
-                {groups.map(({ group, items }) => {
+                {visibleGroups.map(({ group, items }) => {
                     if (!items.length) return null;
+                    const completedCount = items.filter((item) => item.status === "success").length;
+                    const runningCount = items.filter((item) => item.status === "running").length;
+                    const failedCount = items.filter((item) => item.status === "failed").length;
+                    const sourceFolders = Array.from(new Set(items.map((item) => item.sourceFolderName).filter(Boolean)));
                     return (
-                    <section key={group} className="space-y-3">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                            <div className="flex items-center gap-2">
-                                <h3 className="text-base font-semibold">{packageGroupTitle(group)}</h3>
-                                <Tag className="m-0">{items.filter((item) => item.status === "success").length}/{items.length}</Tag>
-                                <Tag className="m-0">{group === "detail" ? "竖版详情" : "1:1"}</Tag>
+                        <section key={group} className={cn("relative overflow-hidden rounded-xl border shadow-sm", packageGroupBlockClass(group))}>
+                            <div className={cn("absolute left-0 top-0 h-full w-1", packageGroupAccentClass(group))} />
+                            <div className={cn("border-b px-4 py-3 pl-5", packageGroupHeaderClass(group))}>
+                                <div className="flex flex-wrap items-center justify-between gap-3">
+                                    <div className="flex min-w-0 items-center gap-3">
+                                        <div className={cn("flex size-10 shrink-0 items-center justify-center rounded-lg text-sm font-semibold", packageGroupMarkClass(group))}>{packageGroupShortTitle(group)}</div>
+                                        <div className="min-w-0">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <h3 className="text-lg font-semibold leading-tight">{packageGroupSectionTitle(group)}</h3>
+                                                <Tag className="m-0">
+                                                    {completedCount}/{items.length}
+                                                </Tag>
+                                                {runningCount ? (
+                                                    <Tag className="m-0" color="processing">
+                                                        {runningCount} 生成中
+                                                    </Tag>
+                                                ) : null}
+                                                {failedCount ? (
+                                                    <Tag className="m-0" color="red">
+                                                        失败 {failedCount}
+                                                    </Tag>
+                                                ) : null}
+                                            </div>
+                                            <div className="mt-1 truncate text-xs text-stone-500 dark:text-stone-400">{sourceFolders.length ? `来源：${sourceFolders.join("、")}` : packageGroupTitle(group)}</div>
+                                        </div>
+                                    </div>
+                                    <Button size="small" icon={<Download className="size-3.5" />} disabled={!items.some((item) => item.image)} onClick={() => void downloadPackageItems(items, `${packageData.packageName}-${packageGroupTitle(group)}`)}>
+                                        下载本组
+                                    </Button>
+                                </div>
                             </div>
-                            <Button size="small" icon={<Download className="size-3.5" />} disabled={!items.some((item) => item.image)} onClick={() => void downloadPackageItems(items, `${packageData.packageName}-${packageGroupTitle(group)}`)}>
-                                下载本组
-                            </Button>
-                        </div>
-                        <div className={cn("grid gap-3", group === "detail" ? "sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4" : "sm:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5")}>
-                            {items.map((item) => (
-                                <PackageItemCard
-                                    key={item.id}
-                                    item={item}
-                                    now={now}
-                                    onCopyPrompt={onCopyPrompt}
-                                    onUpdatePrompt={(prompt) => onUpdatePrompt(item.id, prompt)}
-                                    onRetry={() => onRetryItem(item.id)}
-                                    onDownload={() => onDownloadPackageItem(item)}
-                                    onSaveAsset={() => item.image && void onSaveAsset(item.image, item.index - 1)}
-                                    onEdit={() => item.image && void onEdit(item.image, item.index - 1)}
-                                />
-                            ))}
-                        </div>
-                    </section>
+                            <div className="p-3 pl-4 lg:p-4 lg:pl-5">
+                                <div className={cn("grid gap-3", group === "detail" ? "sm:grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3" : "sm:grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3")}>
+                                    {items.map((item) => (
+                                        <PackageItemCard
+                                            key={item.id}
+                                            item={item}
+                                            now={now}
+                                            selected={Boolean(item.selected)}
+                                            onSelectedChange={(checked) => onToggleItemSelected(item.id, checked)}
+                                            onCopyPrompt={onCopyPrompt}
+                                            onUpdatePrompt={(prompt, options) => onUpdatePrompt(item.id, prompt, options)}
+                                            onRetry={(promptOverride) => onRetryItem(item.id, promptOverride)}
+                                            onDownload={() => onDownloadPackageItem(item)}
+                                            onCopyLink={() => item.image && void onCopyImageLink(item.image, item.index - 1)}
+                                            linking={Boolean(item.image && linkingImageId === item.image.id)}
+                                            historyLogs={itemHistoryMap.get(item.index) || []}
+                                            linkingImageId={linkingImageId}
+                                            onPreviewHistoryLog={onPreviewLog}
+                                            onDownloadHistoryImage={onDownloadImage}
+                                            onCopyHistoryImageLink={onCopyImageLink}
+                                            onSaveAsset={() => item.image && void onSaveAsset(item.image, item.index - 1)}
+                                            onEdit={() => item.image && void onEdit(item.image, item.index - 1)}
+                                        />
+                                    ))}
+                                </div>
+                            </div>
+                        </section>
                     );
                 })}
             </div>
@@ -2671,94 +3672,138 @@ function PackageResultsPanel({
 function PackageItemCard({
     item,
     now,
+    selected,
+    onSelectedChange,
     onCopyPrompt,
     onUpdatePrompt,
     onRetry,
     onDownload,
+    onCopyLink,
+    linking,
+    historyLogs,
+    linkingImageId,
+    onPreviewHistoryLog,
+    onDownloadHistoryImage,
+    onCopyHistoryImageLink,
     onSaveAsset,
     onEdit,
 }: {
     item: ProductPackageItem;
     now: number;
+    selected: boolean;
+    onSelectedChange: (checked: boolean) => void;
     onCopyPrompt: (text: string) => void | Promise<void>;
-    onUpdatePrompt: (prompt: string) => void | Promise<void>;
-    onRetry: () => void;
+    onUpdatePrompt: (prompt: string, options?: { silent?: boolean; allowEmpty?: boolean }) => void | Promise<void>;
+    onRetry: (promptOverride?: string) => void;
     onDownload: () => void;
+    onCopyLink: () => void;
+    linking: boolean;
+    historyLogs: GenerationLog[];
+    linkingImageId: string;
+    onPreviewHistoryLog: (log: GenerationLog) => void;
+    onDownloadHistoryImage: (image: GeneratedImage, index: number) => void;
+    onCopyHistoryImageLink: (image: GeneratedImage, index: number) => void | Promise<void>;
     onSaveAsset: () => void;
     onEdit: () => void;
 }) {
     const [expanded, setExpanded] = useState(false);
     const [detailOpen, setDetailOpen] = useState(false);
-    const [promptEditorOpen, setPromptEditorOpen] = useState(false);
+    const [historyOpen, setHistoryOpen] = useState(false);
     const [promptDraft, setPromptDraft] = useState(stripPromptTaskPrefix(item.prompt));
-    const aspect = item.group === "detail" ? "aspect-[9/16]" : "aspect-square";
+    const aspect = packageItemAspectClass(item);
+    const referenceImage = packageTaskReference(item);
+    const referenceInputIndex = referenceImage ? item.references.findIndex((reference) => reference.id === referenceImage.id) : -1;
+    const referenceLabel = referenceInputIndex >= 0 ? `${referenceAlias(referenceInputIndex)} · 参考图` : "参考图";
+    const savedPrompt = stripPromptTaskPrefix(item.prompt);
+    const promptDirty = promptDraft.trim() !== savedPrompt.trim();
     useEffect(() => {
-        if (!promptEditorOpen) setPromptDraft(stripPromptTaskPrefix(item.prompt));
-    }, [item.prompt, promptEditorOpen]);
+        setPromptDraft(stripPromptTaskPrefix(item.prompt));
+    }, [item.prompt]);
+    const savePromptDraft = async (value = promptDraft, allowEmpty = false) => {
+        const nextPrompt = value.trim();
+        if ((!nextPrompt && !allowEmpty) || nextPrompt === savedPrompt.trim()) return Boolean(nextPrompt);
+        await Promise.resolve(onUpdatePrompt(nextPrompt, { silent: true, allowEmpty }));
+        return Boolean(nextPrompt);
+    };
+    const runCurrentPrompt = async () => {
+        const nextPrompt = promptDraft.trim();
+        if (!nextPrompt || item.status === "running") return;
+        if (promptDirty) await savePromptDraft(nextPrompt);
+        onRetry(nextPrompt);
+    };
     return (
-        <div className={cn("overflow-hidden rounded-lg border bg-background dark:bg-stone-950", item.status === "failed" ? "border-red-200 dark:border-red-950" : item.status === "running" ? "border-sky-300 dark:border-sky-800" : "border-stone-200 dark:border-stone-800")}>
-            <div className={cn("relative bg-stone-100 dark:bg-stone-900", aspect)}>
-                <div className="absolute left-1.5 top-1.5 z-10 flex gap-1">
-                    <Tag className="m-0 text-[10px]" color={packageStatusColor(item.status)}>
-                        {packageStatusLabel(item.status)}
-                    </Tag>
-                    <Tag className="m-0 text-[10px]">{item.title}</Tag>
-                </div>
-                <ReferenceThumbnailOverlay references={item.references} className="right-1.5 top-1.5" />
-                {item.status === "success" && item.image ? (
-                    <Image src={item.image.dataUrl} alt={item.title} className={cn("object-cover", aspect)} />
-                ) : item.status === "failed" ? (
-                    <div className="flex size-full flex-col items-center justify-center gap-3 p-5 text-center text-red-500">
-                        <AlertCircle className="size-7" />
-                        <span className="text-sm font-medium">生成失败</span>
-                    </div>
-                ) : item.status === "running" ? (
-                    <div className="flex size-full flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
-                        <LoaderCircle className="size-6 animate-spin text-sky-500" />
-                        <span>生成中</span>
-                        <span className="rounded-full bg-white/80 px-2 py-1 text-xs text-stone-600 shadow-sm dark:bg-stone-950/70 dark:text-stone-300">{formatDuration(Math.max(0, now - (item.startedAt || now)))}</span>
-                    </div>
-                ) : (
-                    <div className="flex size-full flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
-                        <ImagePlus className="size-7" />
-                        <span>等待生成</span>
-                    </div>
-                )}
+        <div
+            className={cn(
+                "overflow-hidden rounded-xl border bg-white shadow-sm transition hover:-translate-y-0.5 hover:shadow-md dark:bg-[#121212]",
+                selected
+                    ? "border-sky-500 shadow-[0_0_0_1px_rgba(14,165,233,.35)]"
+                    : item.status === "failed"
+                      ? "border-red-300/80 dark:border-red-900/80"
+                      : item.status === "running"
+                        ? "border-sky-400/70 dark:border-sky-700/80"
+                        : "border-stone-200 dark:border-stone-800",
+            )}
+        >
+            <div className="flex items-center justify-between gap-2 border-b border-stone-200 px-2 py-1.5 dark:border-stone-800">
+                <Checkbox checked={selected} disabled={item.status === "running"} onChange={(event) => onSelectedChange(event.target.checked)}>
+                    <span className="text-xs font-medium">{item.title}</span>
+                </Checkbox>
+                <Tag className="m-0 text-[10px]" color={packageStatusColor(item.status)}>
+                    {packageStatusLabel(item.status)}
+                </Tag>
             </div>
-            <div className="space-y-2 border-t border-stone-200 p-2.5 text-xs dark:border-stone-800">
-                <div className="flex items-center justify-between gap-2">
-                    <div className="min-w-0 truncate font-medium text-stone-800 dark:text-stone-100">{item.title}</div>
-                    <Tag className="m-0 shrink-0 text-[10px]">{item.config.size || (item.group === "detail" ? "9:16" : "1:1")}</Tag>
-                </div>
-                {item.prompt ? (
-                    <div className="rounded-md bg-stone-50 p-2 dark:bg-stone-900">
-                        <div className="mb-1 text-[10px] font-medium text-stone-500 dark:text-stone-400">提示词</div>
-                        <div className={`${expanded ? "" : "line-clamp-2"} whitespace-pre-wrap text-stone-700 dark:text-stone-200`}>{stripPromptTaskPrefix(item.prompt)}</div>
-                        <div className="mt-2 flex flex-wrap justify-end gap-x-2 gap-y-1">
-                            <Button size="small" type="text" className="!h-6 !px-1.5 whitespace-nowrap" onClick={() => setPromptEditorOpen(true)}>
-                                修改
-                            </Button>
-                            <Button size="small" type="text" className="!h-6 !px-1.5 whitespace-nowrap" onClick={() => void onCopyPrompt(stripPromptTaskPrefix(item.prompt))}>
-                                复制
-                            </Button>
-                            <Button size="small" type="text" className="!h-6 !px-1.5 whitespace-nowrap" onClick={() => setExpanded((value) => !value)}>
-                                {expanded ? "收起" : "展开"}
-                            </Button>
+            <div className="grid grid-cols-2 gap-px bg-stone-200 dark:bg-stone-800">
+                <PackageComparisonPane className={aspect} label={referenceLabel}>
+                    {referenceImage?.dataUrl ? <Image src={referenceImage.dataUrl} alt={referenceImage.name || `${item.title}参考图`} wrapperStyle={fullImageWrapperStyle} style={fullImageContainStyle} preview={{ mask: null }} /> : <EmptyReferencePane />}
+                </PackageComparisonPane>
+                <PackageComparisonPane className={aspect} label="生成图">
+                    {item.status === "success" && item.image ? (
+                        <Image src={item.image.dataUrl} alt={item.title} wrapperStyle={fullImageWrapperStyle} style={fullImageContainStyle} />
+                    ) : item.status === "failed" ? (
+                        <div className="flex size-full flex-col items-center justify-center gap-3 p-5 text-center text-red-500">
+                            <AlertCircle className="size-7" />
+                            <span className="text-sm font-medium">生成失败</span>
                         </div>
+                    ) : item.status === "running" ? (
+                        <div className="flex size-full flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
+                            <LoaderCircle className="size-6 animate-spin text-sky-500" />
+                            <span>生成中</span>
+                            <span className="rounded-full bg-white/80 px-2 py-1 text-xs text-stone-600 shadow-sm dark:bg-stone-950/70 dark:text-stone-300">{formatDuration(Math.max(0, now - (item.startedAt || now)))}</span>
+                        </div>
+                    ) : (
+                        <div className="flex size-full flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
+                            <ImagePlus className="size-7" />
+                            <span>等待生成</span>
+                        </div>
+                    )}
+                </PackageComparisonPane>
+            </div>
+            <div className="space-y-1 border-t border-stone-200 p-1.5 text-xs dark:border-stone-800">
+                <div className="rounded-md bg-stone-50 p-1 dark:bg-stone-900">
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                        <span className="text-[10px] font-medium text-stone-500 dark:text-stone-400">提示词</span>
+                        {promptDirty ? <span className="text-[10px] text-sky-500">自动保存</span> : null}
                     </div>
-                ) : (
-                    <div className="rounded-md bg-stone-50 p-2 text-stone-500 dark:bg-stone-900">等待工作流生成提示词</div>
-                )}
-                <div className="flex flex-wrap gap-1">
-                    <Tag className="m-0 text-[10px]">{item.model}</Tag>
-                    <Tag className="m-0 text-[10px]">{item.config.quality || "auto"}</Tag>
-                    {item.durationMs ? <Tag className="m-0 text-[10px]">{formatDuration(item.durationMs)}</Tag> : null}
-                    {item.image ? (
-                        <>
-                            <Tag className="m-0 text-[10px]">{item.image.width}x{item.image.height}</Tag>
-                            <Tag className="m-0 text-[10px]">{formatBytes(item.image.bytes)}</Tag>
-                        </>
-                    ) : null}
+                    <Input.TextArea
+                        value={promptDraft}
+                        autoSize={{ minRows: expanded ? 4 : 1, maxRows: expanded ? 6 : 1 }}
+                        disabled={item.status === "running"}
+                        placeholder="例如：把图片1的产品替换到图片2里，保持图片2构图和文字风格"
+                        className="!rounded-lg !border-stone-200 !bg-white/80 !text-xs dark:!border-stone-800 dark:!bg-stone-950/60"
+                        onChange={(event) => {
+                            const nextValue = event.target.value;
+                            setPromptDraft(nextValue);
+                            void savePromptDraft(nextValue, true);
+                        }}
+                    />
+                    <div className="mt-1 flex flex-wrap justify-end gap-x-2 gap-y-1">
+                        <Button size="small" type="text" className="!h-5 !px-1.5 whitespace-nowrap text-xs" disabled={!promptDraft.trim()} onClick={() => void onCopyPrompt(promptDraft.trim())}>
+                            复制
+                        </Button>
+                        <Button size="small" type="text" className="!h-5 !px-1.5 whitespace-nowrap text-xs" onClick={() => setExpanded((value) => !value)}>
+                            {expanded ? "收起" : "展开"}
+                        </Button>
+                    </div>
                 </div>
                 {item.error ? (
                     <div className="flex items-start justify-between gap-2 rounded-md bg-red-100 px-2 py-1 text-red-600 dark:bg-red-950/40 dark:text-red-300">
@@ -2769,12 +3814,16 @@ function PackageItemCard({
                     </div>
                 ) : null}
             </div>
-            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-2 border-t border-stone-200 px-2.5 py-2 dark:border-stone-800">
+            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 border-t border-stone-200 px-2 py-1.5 dark:border-stone-800">
                 <div className="text-[10px] text-stone-500 dark:text-stone-400">第 {item.index} 张</div>
                 <div className="flex shrink-0 gap-1">
-                    <Button size="small" icon={<RotateCcw className="size-3.5" />} disabled={item.status === "running" || !item.prompt.trim()} onClick={onRetry}>
-                        重试
+                    <Button size="small" className="!h-7" icon={<RotateCcw className="size-3.5" />} disabled={item.status === "running" || !promptDraft.trim()} onClick={() => void runCurrentPrompt()}>
+                        {item.image || item.status === "failed" ? "重试" : "生成"}
                     </Button>
+                    <Button size="small" icon={<History className="size-3.5" />} disabled={!historyLogs.length} onClick={() => setHistoryOpen(true)}>
+                        历史{historyLogs.length > 1 ? ` ${historyLogs.length}` : ""}
+                    </Button>
+                    <Button size="small" loading={linking} icon={<Link2 className="size-3.5" />} disabled={!item.image} onClick={onCopyLink} />
                     <Button size="small" icon={<FolderPlus className="size-3.5" />} disabled={!item.image} onClick={onSaveAsset} />
                     <Button size="small" icon={<ImagePlus className="size-3.5" />} disabled={!item.image} onClick={onEdit} />
                     <Button size="small" icon={<Download className="size-3.5" />} disabled={!item.image} onClick={onDownload} />
@@ -2783,28 +3832,207 @@ function PackageItemCard({
             <Modal title="失败详情" open={detailOpen} width={760} onCancel={() => setDetailOpen(false)} footer={null}>
                 <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-md bg-stone-950 p-3 text-xs text-stone-100">{formatFailureDetailText(item.errorDetail, item.error)}</pre>
             </Modal>
-            <Modal
-                title="修改提示词"
-                open={promptEditorOpen}
-                width={760}
-                onCancel={() => setPromptEditorOpen(false)}
-                onOk={() => {
-                    void Promise.resolve(onUpdatePrompt(promptDraft)).then(() => setPromptEditorOpen(false));
+            <PackageItemHistoryModal
+                open={historyOpen}
+                item={item}
+                logs={historyLogs}
+                linkingImageId={linkingImageId}
+                onClose={() => setHistoryOpen(false)}
+                onPreviewLog={(log) => {
+                    setHistoryOpen(false);
+                    onPreviewHistoryLog(log);
                 }}
-                okText="保存"
-                cancelText="取消"
-                okButtonProps={{ disabled: !promptDraft.trim() }}
-            >
-                <Input.TextArea value={promptDraft} autoSize={{ minRows: 8, maxRows: 16 }} onChange={(event) => setPromptDraft(event.target.value)} />
-            </Modal>
+                onCopyPrompt={onCopyPrompt}
+                onDownload={onDownloadHistoryImage}
+                onCopyLink={onCopyHistoryImageLink}
+            />
         </div>
+    );
+}
+
+function PackageComparisonPane({ className, label, children }: { className: string; label: string; children: ReactNode }) {
+    return (
+        <div
+            className={cn(
+                "relative bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.08),transparent_58%),linear-gradient(135deg,rgba(120,113,108,0.10),rgba(28,25,23,0.03))] dark:bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.07),transparent_58%),linear-gradient(135deg,rgba(68,64,60,0.32),rgba(12,12,12,0.95))]",
+                className,
+            )}
+        >
+            <div className="absolute left-1.5 top-1.5 z-10 rounded bg-black/60 px-1.5 py-0.5 text-[10px] font-medium text-white">{label}</div>
+            {children}
+        </div>
+    );
+}
+
+function EmptyReferencePane() {
+    return (
+        <div className="flex size-full flex-col items-center justify-center gap-2 p-4 text-center text-sm text-stone-500 dark:text-stone-400">
+            <ImagePlus className="size-7" />
+            <span>没有参考图</span>
+        </div>
+    );
+}
+
+function PackageItemHistoryModal({
+    open,
+    item,
+    logs,
+    linkingImageId,
+    onClose,
+    onPreviewLog,
+    onCopyPrompt,
+    onDownload,
+    onCopyLink,
+}: {
+    open: boolean;
+    item: ProductPackageItem;
+    logs: GenerationLog[];
+    linkingImageId: string;
+    onClose: () => void;
+    onPreviewLog: (log: GenerationLog) => void;
+    onCopyPrompt: (text: string) => void | Promise<void>;
+    onDownload: (image: GeneratedImage, index: number) => void;
+    onCopyLink: (image: GeneratedImage, index: number) => void | Promise<void>;
+}) {
+    const sortedLogs = sortPackageItemHistoryLogs(logs);
+    return (
+        <Modal title={`${item.title} 历史记录（${sortedLogs.length}）`} open={open} width={960} footer={null} onCancel={onClose}>
+            {sortedLogs.length ? (
+                <div className="grid max-h-[70vh] gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+                    {sortedLogs.map((historyLog, index) => {
+                        const image = historyLog.images.find((entry) => Boolean(entry.dataUrl));
+                        const isCurrent = historyLog.id === item.logId;
+                        const versionLabel = resolvePackageHistoryVersionLabel(historyLog, index);
+                        return (
+                            <div key={historyLog.id} className={cn("overflow-hidden rounded-xl border bg-background dark:bg-stone-950", isCurrent ? "border-sky-500 shadow-[0_0_0_1px_rgba(14,165,233,.35)]" : "border-stone-200 dark:border-stone-800")}>
+                                <div className="relative aspect-square bg-stone-100 dark:bg-stone-900">
+                                    <div className="absolute left-2 top-2 z-10 flex flex-wrap gap-1">
+                                        <Tag className="m-0 text-[10px]" color={isCurrent ? "blue" : "default"}>
+                                            {versionLabel}
+                                        </Tag>
+                                        {isCurrent ? (
+                                            <Tag className="m-0 text-[10px]" color="processing">
+                                                当前
+                                            </Tag>
+                                        ) : null}
+                                        <Tag className="m-0 text-[10px]" color={historyLog.failCount ? "red" : "green"}>
+                                            {historyLog.status}
+                                        </Tag>
+                                    </div>
+                                    {image ? (
+                                        <Image src={image.dataUrl} alt={`${item.title} ${versionLabel}`} wrapperStyle={fullImageWrapperStyle} style={fullImageContainStyle} />
+                                    ) : (
+                                        <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-red-500">
+                                            <AlertCircle className="size-7" />
+                                            <span>{historyLog.errors[0] || "没有可显示的图片"}</span>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="space-y-2 border-t border-stone-200 p-3 text-xs dark:border-stone-800">
+                                    <div className="flex flex-wrap items-center gap-1 text-[11px] text-stone-500 dark:text-stone-400">
+                                        <span>{formatLogTime(historyLog.createdAt)}</span>
+                                        <span>{formatDuration(historyLog.durationMs)}</span>
+                                        {historyLog.retryOfVersionNo ? <Tag className="m-0 text-[10px]">由 V{historyLog.retryOfVersionNo} 重试</Tag> : null}
+                                    </div>
+                                    <div className="line-clamp-2 whitespace-pre-wrap text-stone-700 dark:text-stone-200">{stripPromptTaskPrefix(historyLog.prompt)}</div>
+                                    <div className="flex flex-wrap gap-1">
+                                        <Button size="small" onClick={() => onPreviewLog(historyLog)}>
+                                            载入
+                                        </Button>
+                                        <Button size="small" icon={<Copy className="size-3.5" />} onClick={() => void onCopyPrompt(stripPromptTaskPrefix(historyLog.prompt))}>
+                                            复制
+                                        </Button>
+                                        <Button size="small" loading={Boolean(image && linkingImageId === image.id)} icon={<Link2 className="size-3.5" />} disabled={!image} onClick={() => image && void onCopyLink(image, item.index - 1)} />
+                                        <Button size="small" icon={<Download className="size-3.5" />} disabled={!image} onClick={() => image && onDownload(image, item.index - 1)} />
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            ) : (
+                <Empty description="暂无历史记录" />
+            )}
+        </Modal>
     );
 }
 
 function packageGroupTitle(group: ProductPackageGroup) {
     if (group === "main") return "主图";
     if (group === "sub") return "副图";
+    if (group === "sku") return "SKU";
+    if (group === "other") return "其他参考";
     return "详情图";
+}
+
+function packageGroupShortTitle(group: ProductPackageGroup) {
+    if (group === "main") return "主";
+    if (group === "sku") return "SKU";
+    if (group === "detail") return "详";
+    if (group === "sub") return "副";
+    return "其";
+}
+
+function packageGroupSectionTitle(group: ProductPackageGroup) {
+    if (group === "main") return "主图区";
+    if (group === "sku") return "SKU 区";
+    if (group === "detail") return "详情区";
+    if (group === "sub") return "副图区";
+    return "其他参考区";
+}
+
+function packageGroupColor(group: ProductPackageGroup) {
+    if (group === "main") return "blue";
+    if (group === "sub") return "cyan";
+    if (group === "detail") return "purple";
+    if (group === "sku") return "gold";
+    return "default";
+}
+
+function packageGroupBlockClass(group: ProductPackageGroup) {
+    if (group === "main") return "border-sky-300/70 bg-white dark:border-sky-900/70 dark:bg-[#141b20]";
+    if (group === "sku") return "border-amber-300/75 bg-white dark:border-amber-900/70 dark:bg-[#1d1910]";
+    if (group === "detail") return "border-fuchsia-300/70 bg-white dark:border-fuchsia-900/70 dark:bg-[#1b141c]";
+    if (group === "sub") return "border-cyan-300/70 bg-white dark:border-cyan-900/70 dark:bg-[#121c1d]";
+    return "border-stone-200 bg-white dark:border-stone-800 dark:bg-[#171717]";
+}
+
+function packageGroupHeaderClass(group: ProductPackageGroup) {
+    if (group === "main") return "border-sky-200/70 bg-sky-50/85 dark:border-sky-900/70 dark:bg-sky-950/25";
+    if (group === "sku") return "border-amber-200/80 bg-amber-50/90 dark:border-amber-900/70 dark:bg-amber-950/25";
+    if (group === "detail") return "border-fuchsia-200/75 bg-fuchsia-50/85 dark:border-fuchsia-900/70 dark:bg-fuchsia-950/25";
+    if (group === "sub") return "border-cyan-200/75 bg-cyan-50/85 dark:border-cyan-900/70 dark:bg-cyan-950/25";
+    return "border-stone-200 bg-stone-50 dark:border-stone-800 dark:bg-stone-900/70";
+}
+
+function packageGroupMarkClass(group: ProductPackageGroup) {
+    if (group === "main") return "bg-sky-500 text-white shadow-sm shadow-sky-500/25";
+    if (group === "sku") return "bg-amber-400 text-stone-950 shadow-sm shadow-amber-500/25";
+    if (group === "detail") return "bg-fuchsia-500 text-white shadow-sm shadow-fuchsia-500/25";
+    if (group === "sub") return "bg-cyan-500 text-white shadow-sm shadow-cyan-500/25";
+    return "bg-stone-700 text-white shadow-sm";
+}
+
+function packageGroupAccentClass(group: ProductPackageGroup) {
+    if (group === "main") return "bg-sky-500";
+    if (group === "sku") return "bg-amber-400";
+    if (group === "detail") return "bg-fuchsia-500";
+    if (group === "sub") return "bg-cyan-500";
+    return "bg-stone-500";
+}
+
+function packageItemAspectClass(item: ProductPackageItem) {
+    const dimensions = parsePixelSize(item.config.size);
+    if (!dimensions) return item.group === "detail" ? "aspect-[3/4]" : "aspect-square";
+    const ratio = dimensions.width / Math.max(1, dimensions.height);
+    if (ratio < 0.72) return "aspect-[3/4]";
+    if (ratio < 0.95) return "aspect-[4/5]";
+    if (ratio > 1.25) return "aspect-[4/3]";
+    return "aspect-square";
+}
+
+function packageTaskReference(item: ProductPackageItem) {
+    return item.references[1] || item.references.find((reference) => Boolean(reference.dataUrl));
 }
 
 function packageStatusLabel(status: ProductPackageItemStatus) {
@@ -2822,7 +4050,7 @@ function packageStatusColor(status: ProductPackageItemStatus) {
 }
 
 function shouldDisplayPackageItem(item: ProductPackageItem) {
-    return Boolean(item.prompt.trim() || item.image || item.error || item.status !== "waiting");
+    return Boolean(item.prompt.trim() || item.image || item.error || item.status !== "waiting" || (item.sourceFileName && packageTaskReference(item)));
 }
 
 function stripPromptTaskPrefix(prompt: string) {
@@ -2836,7 +4064,17 @@ function GenerationSettings({ config, model, updateConfig, openConfigDialog }: {
     return (
         <div className="space-y-3">
             <SettingSubsection title="模型" summary={model || "未选择模型"} collapsed={modelCollapsed} onToggle={() => setModelCollapsed((value) => !value)}>
-                <ModelPicker config={config} value={model} channelId={config.imageChannelId} onChange={(value, channelId) => { updateConfig("imageModel", value); if (channelId) updateConfig("imageChannelId", channelId); }} fullWidth onMissingConfig={() => openConfigDialog(false)} />
+                <ModelPicker
+                    config={config}
+                    value={model}
+                    channelId={config.imageChannelId}
+                    onChange={(value, channelId) => {
+                        updateConfig("imageModel", value);
+                        if (channelId) updateConfig("imageChannelId", channelId);
+                    }}
+                    fullWidth
+                    onMissingConfig={() => openConfigDialog(false)}
+                />
             </SettingSubsection>
             <ImageSettingsPanel config={config} onConfigChange={(key, value) => updateConfig(key, value)} theme={theme} showTitle={false} className="space-y-3" maxCount={10} collapsible />
         </div>
@@ -2858,25 +4096,44 @@ function SettingSubsection({ title, summary, collapsed, children, onToggle }: { 
     );
 }
 
+function ResultSelectionControls({ selected, onSelectedChange, onDelete }: { selected: boolean; onSelectedChange: (checked: boolean) => void; onDelete: () => void }) {
+    return (
+        <div className="absolute left-1.5 top-1.5 z-20 flex items-center gap-1 rounded-md bg-white/85 px-1.5 py-1 shadow-sm dark:bg-stone-950/80">
+            <Checkbox checked={selected} onChange={(event) => onSelectedChange(event.target.checked)} />
+            {selected ? <Button size="small" danger type="text" icon={<Trash2 className="size-3.5" />} onClick={onDelete} /> : null}
+        </div>
+    );
+}
+
 function ResultImageCard({
     result,
     image,
     index,
+    selected,
+    onSelectedChange,
+    onDelete,
     onCopyPrompt,
     onUpdatePrompt,
     onRetry,
     onEdit,
     onDownload,
+    onCopyLink,
+    linking,
     onSaveAsset,
 }: {
     result: GenerationResult;
     image: GeneratedImage;
     index: number;
+    selected: boolean;
+    onSelectedChange: (checked: boolean) => void;
+    onDelete: () => void;
     onCopyPrompt: (text: string) => void | Promise<void>;
     onUpdatePrompt: (resultId: string, prompt: string) => boolean;
     onRetry: () => void;
     onEdit: (image: GeneratedImage, index: number) => void;
     onDownload: (image: GeneratedImage, index: number) => void;
+    onCopyLink: (image: GeneratedImage, index: number) => void | Promise<void>;
+    linking: boolean;
     onSaveAsset: (image: GeneratedImage, index: number) => void;
 }) {
     const [promptEditorOpen, setPromptEditorOpen] = useState(false);
@@ -2889,11 +4146,9 @@ function ResultImageCard({
     return (
         <div className="overflow-hidden rounded-lg border border-stone-200 bg-background dark:border-stone-800">
             <div className="relative aspect-[4/3] bg-stone-100 dark:bg-stone-900">
-                <Tag className="absolute right-1.5 top-1.5 z-10 m-0 text-[10px]" color="blue">
-                    新生成
-                </Tag>
-                <ReferenceThumbnailOverlay references={result.references} className="left-1.5 top-1.5" />
-                <Image src={image.dataUrl} alt={`生成结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                <ResultSelectionControls selected={selected} onSelectedChange={onSelectedChange} onDelete={onDelete} />
+                <span className="absolute right-1.5 top-1.5 z-10 rounded bg-blue-600 px-1.5 py-0.5 text-[10px] leading-none text-white shadow-sm">新生成</span>
+                <Image src={image.dataUrl} alt={`生成结果 ${index + 1}`} wrapperStyle={fullImageWrapperStyle} style={fullImageContainStyle} />
             </div>
             <TaskInfo
                 result={result}
@@ -2919,8 +4174,9 @@ function ResultImageCard({
                         items={[
                             { label: "模型", value: result.model },
                             { label: "接口", value: result.config.apiMode === "responses" ? "Responses" : "Images" },
-                            { label: "尺寸", value: result.config.size || `${image.width}x${image.height}` },
-                            { label: "质量", value: result.config.quality || "auto" },
+                            { label: "请求尺寸", value: result.config.size || "auto" },
+                            { label: "实际像素", value: `${image.width}x${image.height}` },
+                            { label: "分辨率", value: imageResolutionLabel(result.config.size || `${image.width}x${image.height}`) },
                             { label: "格式", value: result.config.outputFormat || "png" },
                             { label: "压缩", value: (result.config.outputFormat || "png") !== "png" ? result.config.outputCompression || "100" : "" },
                             { label: "审核", value: result.config.moderation || "auto" },
@@ -2929,6 +4185,7 @@ function ResultImageCard({
                         ]}
                     />
                     <Button size="small" icon={<RotateCcw className="size-3.5" />} onClick={onRetry} />
+                    <Button size="small" loading={linking} icon={<Link2 className="size-3.5" />} onClick={() => void onCopyLink(image, index)} />
                     <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => void onSaveAsset(image, index)} />
                     <Button size="small" icon={<ImagePlus className="size-3.5" />} onClick={() => void onEdit(image, index)} />
                     <Button size="small" icon={<Download className="size-3.5" />} onClick={() => onDownload(image, index)} />
@@ -2951,12 +4208,27 @@ function ResultImageCard({
     );
 }
 
-function PendingImageCard({ result, now, onCopyPrompt }: { result: GenerationResult; now: number; onCopyPrompt: (text: string) => void | Promise<void> }) {
+function PendingImageCard({
+    result,
+    now,
+    selected,
+    onSelectedChange,
+    onDelete,
+    onCopyPrompt,
+}: {
+    result: GenerationResult;
+    now: number;
+    selected: boolean;
+    onSelectedChange: (checked: boolean) => void;
+    onDelete: () => void;
+    onCopyPrompt: (text: string) => void | Promise<void>;
+}) {
     const isRunning = result.status === "running";
     const startedAt = result.startedAt || result.createdAt;
     return (
         <div className="overflow-hidden rounded-lg border border-dashed border-stone-300 bg-stone-50 dark:border-stone-700 dark:bg-stone-900">
             <div className="relative aspect-[4/3]">
+                <ResultSelectionControls selected={selected} onSelectedChange={onSelectedChange} onDelete={onDelete} />
                 <div
                     className="absolute inset-0 opacity-60"
                     style={{
@@ -2967,7 +4239,11 @@ function PendingImageCard({ result, now, onCopyPrompt }: { result: GenerationRes
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-sm text-stone-500 dark:text-stone-400">
                     {isRunning ? <LoaderCircle className="size-6 animate-spin" /> : <WandSparkles className="size-6" />}
                     <span>{isRunning ? "生成中" : "等待中"}</span>
-                    {isRunning ? <span className="rounded-full bg-white/80 px-2 py-1 text-xs text-stone-600 shadow-sm dark:bg-stone-950/70 dark:text-stone-300">{formatDuration(Math.max(0, now - startedAt))}</span> : <span className="rounded-full bg-white/80 px-2 py-1 text-xs text-stone-600 shadow-sm dark:bg-stone-950/70 dark:text-stone-300">队列中</span>}
+                    {isRunning ? (
+                        <span className="rounded-full bg-white/80 px-2 py-1 text-xs text-stone-600 shadow-sm dark:bg-stone-950/70 dark:text-stone-300">{formatDuration(Math.max(0, now - startedAt))}</span>
+                    ) : (
+                        <span className="rounded-full bg-white/80 px-2 py-1 text-xs text-stone-600 shadow-sm dark:bg-stone-950/70 dark:text-stone-300">队列中</span>
+                    )}
                 </div>
             </div>
             <TaskInfo result={isRunning ? { ...result, durationMs: Math.max(0, now - startedAt) } : result} onCopyPrompt={onCopyPrompt} />
@@ -2975,13 +4251,29 @@ function PendingImageCard({ result, now, onCopyPrompt }: { result: GenerationRes
     );
 }
 
-function FailedImageCard({ result, error, onCopyPrompt, onRetry }: { result: GenerationResult; error: string; onCopyPrompt: (text: string) => void | Promise<void>; onRetry: () => void }) {
+function FailedImageCard({
+    result,
+    error,
+    selected,
+    onSelectedChange,
+    onDelete,
+    onCopyPrompt,
+    onRetry,
+}: {
+    result: GenerationResult;
+    error: string;
+    selected: boolean;
+    onSelectedChange: (checked: boolean) => void;
+    onDelete: () => void;
+    onCopyPrompt: (text: string) => void | Promise<void>;
+    onRetry: () => void;
+}) {
     const [detailOpen, setDetailOpen] = useState(false);
     const detail = result.errorDetail || error;
     return (
         <div className="overflow-hidden rounded-lg border border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20">
             <div className="relative flex aspect-[4/3] flex-col items-center justify-center gap-3 p-5 text-center">
-                <ReferenceThumbnailOverlay references={result.references} className="left-1.5 top-1.5" />
+                <ResultSelectionControls selected={selected} onSelectedChange={onSelectedChange} onDelete={onDelete} />
                 <AlertCircle className="size-7 text-red-500" />
                 <div className="text-sm font-medium text-red-600 dark:text-red-300">生成失败</div>
                 <Typography.Paragraph ellipsis={{ rows: 4 }} className="!mb-0 !text-xs !text-red-500 dark:!text-red-300">
@@ -3027,23 +4319,15 @@ function ParameterButton({ title = "参数", items, buttonClassName = "" }: { ti
     );
 }
 
-function TaskInfo({
-    result,
-    error,
-    onCopyPrompt,
-    promptActions,
-}: {
-    result: GenerationResult;
-    error?: string;
-    onCopyPrompt: (text: string) => void | Promise<void>;
-    promptActions?: ReactNode;
-}) {
+function TaskInfo({ result, error, onCopyPrompt, promptActions }: { result: GenerationResult; error?: string; onCopyPrompt: (text: string) => void | Promise<void>; promptActions?: ReactNode }) {
     const [expanded, setExpanded] = useState(false);
+    const visibleReferences = result.references.filter((item) => Boolean(item.dataUrl));
 
     return (
         <div className="space-y-2 border-t border-stone-200 px-3 py-2.5 text-xs text-stone-500 dark:border-stone-800 dark:text-stone-400">
             <div className="rounded-md bg-stone-50 p-2 dark:bg-stone-900">
                 <div className={`${expanded ? "" : "line-clamp-2"} whitespace-pre-wrap text-stone-700 dark:text-stone-200`}>{result.prompt}</div>
+                {visibleReferences.length ? <ReferenceStrip className="mt-2 border-stone-200 bg-white/60 dark:border-stone-800 dark:bg-stone-950/40" references={visibleReferences} compact /> : null}
                 <div className="mt-2 flex justify-end gap-1">
                     {promptActions}
                     <Button size="small" type="text" icon={<Copy className="size-3.5" />} onClick={() => void onCopyPrompt(result.prompt)}>
@@ -3061,6 +4345,7 @@ function TaskInfo({
 
 function HistoryLogCard({
     log,
+    historyLogs,
     categories,
     index,
     selected,
@@ -3072,13 +4357,18 @@ function HistoryLogCard({
     onCreateCategory,
     onPreview,
     onRetry,
+    onPreviewHistoryLog,
+    onRetryHistoryLog,
     onUpdatePrompt,
     onCopyPrompt,
     onEdit,
     onDownload,
+    onCopyLink,
+    linkingImageId,
     onSaveAsset,
 }: {
     log: GenerationLog;
+    historyLogs: GenerationLog[];
     categories: GenerationCategory[];
     index: number;
     selected: boolean;
@@ -3090,10 +4380,14 @@ function HistoryLogCard({
     onCreateCategory: (name: string) => Promise<GenerationCategory | null>;
     onPreview: () => void;
     onRetry: () => void;
+    onPreviewHistoryLog: (log: GenerationLog) => void;
+    onRetryHistoryLog: (log: GenerationLog) => void;
     onUpdatePrompt: (prompt: string) => boolean | Promise<boolean>;
     onCopyPrompt: (text: string) => void | Promise<void>;
     onEdit: (image: GeneratedImage, index: number) => void;
     onDownload: (image: GeneratedImage, index: number) => void;
+    onCopyLink: (image: GeneratedImage, index: number) => void | Promise<void>;
+    linkingImageId: string;
     onSaveAsset: (image: GeneratedImage, index: number) => void;
 }) {
     const displayImages = log.images.filter((image) => Boolean(image.dataUrl));
@@ -3102,10 +4396,12 @@ function HistoryLogCard({
     const [categoryOpen, setCategoryOpen] = useState(false);
     const [categoryName, setCategoryName] = useState("");
     const [detailOpen, setDetailOpen] = useState(false);
+    const [historyOpen, setHistoryOpen] = useState(false);
     const [promptEditorOpen, setPromptEditorOpen] = useState(false);
     const [promptDraft, setPromptDraft] = useState(log.prompt);
     const categoryMenuRef = useRef<HTMLDivElement>(null);
     const logCategories = categories.filter((category) => log.categoryIds.includes(category.id));
+    const sortedHistoryLogs = useMemo(() => sortLogVersions(historyLogs), [historyLogs]);
     const createCategory = async () => {
         const category = await onCreateCategory(categoryName);
         if (!category) return;
@@ -3142,10 +4438,15 @@ function HistoryLogCard({
                     <Tag className="m-0 text-[10px]" color={log.failCount ? "red" : "blue"}>
                         {log.failCount ? `失败 ${log.failCount}` : "成功"}
                     </Tag>
+                    {sortedHistoryLogs.length > 1 ? (
+                        <Tag className="m-0 text-[10px]">
+                            版本 {resolveLogVersionNo(log)}/{sortedHistoryLogs.length}
+                        </Tag>
+                    ) : null}
                     <Tag className="m-0 text-[10px]">{log.imageCount} 张</Tag>
                 </div>
                 {firstImage ? (
-                    <Image src={firstImage.dataUrl} alt={`历史结果 ${index + 1}`} className="aspect-[4/3] object-cover" />
+                    <Image src={firstImage.dataUrl} alt={`历史结果 ${index + 1}`} wrapperStyle={fullImageWrapperStyle} style={fullImageContainStyle} />
                 ) : (
                     <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-red-500">
                         <AlertCircle className="size-7" />
@@ -3159,10 +4460,12 @@ function HistoryLogCard({
                         ))}
                     </div>
                 ) : null}
-                <ReferenceThumbnailOverlay references={log.references} className="bottom-1.5 right-1.5" />
             </div>
             <div className="space-y-2 border-t border-stone-200 p-2.5 text-xs dark:border-stone-800">
                 <div className={`${expanded ? "" : "line-clamp-2"} whitespace-pre-wrap text-stone-700 dark:text-stone-200`}>{log.prompt}</div>
+                {log.references.some((item) => Boolean(item.dataUrl)) ? (
+                    <ReferenceStrip className="border-stone-200 bg-stone-50 dark:border-stone-800 dark:bg-stone-900/70" references={log.references.filter((item) => Boolean(item.dataUrl))} compact />
+                ) : null}
                 <div className="flex items-center justify-end gap-1">
                     <Button size="small" type="text" icon={<PenLine className="size-3.5" />} onClick={() => closeThen(() => setPromptEditorOpen(true))}>
                         修改
@@ -3204,6 +4507,9 @@ function HistoryLogCard({
                     <Button size="small" icon={<RotateCcw className="size-3.5" />} onClick={() => closeThen(onRetry)}>
                         重试
                     </Button>
+                    <Button size="small" icon={<History className="size-3.5" />} onClick={() => closeThen(() => setHistoryOpen(true))}>
+                        历史{sortedHistoryLogs.length > 1 ? ` ${sortedHistoryLogs.length}` : ""}
+                    </Button>
                     <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => setCategoryOpen((value) => !value)}>
                         分类
                     </Button>
@@ -3211,8 +4517,9 @@ function HistoryLogCard({
                         items={[
                             { label: "模型", value: log.model },
                             { label: "接口", value: log.config.apiMode === "responses" ? "Responses" : "Images" },
-                            { label: "尺寸", value: log.config.size || "auto" },
-                            { label: "质量", value: log.config.quality || "auto" },
+                            { label: "请求尺寸", value: log.config.size || "auto" },
+                            { label: "实际像素", value: firstImage ? `${firstImage.width}x${firstImage.height}` : "" },
+                            { label: "分辨率", value: imageResolutionLabel(log.config.size || "auto") },
                             { label: "格式", value: log.config.outputFormat || "png" },
                             { label: "压缩", value: (log.config.outputFormat || "png") !== "png" ? log.config.outputCompression || "100" : "" },
                             { label: "审核", value: log.config.moderation || "auto" },
@@ -3244,6 +4551,7 @@ function HistoryLogCard({
                 </div>
                 {firstImage ? (
                     <div className="flex shrink-0 gap-1">
+                        <Button size="small" loading={linkingImageId === firstImage.id} icon={<Link2 className="size-3.5" />} onClick={() => closeThen(() => void onCopyLink(firstImage, index))} />
                         <Button size="small" icon={<FolderPlus className="size-3.5" />} onClick={() => closeThen(() => void onSaveAsset(firstImage, index))} />
                         <Button size="small" icon={<ImagePlus className="size-3.5" />} onClick={() => closeThen(() => void onEdit(firstImage, index))} />
                         <Button size="small" icon={<Download className="size-3.5" />} onClick={() => closeThen(() => onDownload(firstImage, index))} />
@@ -3253,6 +4561,24 @@ function HistoryLogCard({
             <Modal title="失败详情" open={detailOpen} width={760} onCancel={() => setDetailOpen(false)} footer={null}>
                 <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap rounded-md bg-stone-950 p-3 text-xs text-stone-100">{formatFailureDetailText(log.errorDetails?.[0], log.errors[0])}</pre>
             </Modal>
+            <VersionHistoryModal
+                open={historyOpen}
+                currentLogId={log.id}
+                logs={sortedHistoryLogs}
+                onClose={() => setHistoryOpen(false)}
+                onPreviewLog={(historyLog) => {
+                    setHistoryOpen(false);
+                    onPreviewHistoryLog(historyLog);
+                }}
+                onRetryLog={(historyLog) => {
+                    setHistoryOpen(false);
+                    onRetryHistoryLog(historyLog);
+                }}
+                onCopyPrompt={onCopyPrompt}
+                onDownload={onDownload}
+                onCopyLink={onCopyLink}
+                linkingImageId={linkingImageId}
+            />
             <Modal
                 title="修改提示词"
                 open={promptEditorOpen}
@@ -3272,16 +4598,91 @@ function HistoryLogCard({
     );
 }
 
-function ReferenceThumbnailOverlay({ references, className = "" }: { references?: ReferenceImage[]; className?: string }) {
-    const visibleReferences = (references || []).filter((item) => Boolean(item.dataUrl)).slice(0, 3);
-    if (!visibleReferences.length) return null;
+function VersionHistoryModal({
+    open,
+    currentLogId,
+    logs,
+    onClose,
+    onPreviewLog,
+    onRetryLog,
+    onCopyPrompt,
+    onDownload,
+    onCopyLink,
+    linkingImageId,
+}: {
+    open: boolean;
+    currentLogId: string;
+    logs: GenerationLog[];
+    onClose: () => void;
+    onPreviewLog: (log: GenerationLog) => void;
+    onRetryLog: (log: GenerationLog) => void;
+    onCopyPrompt: (text: string) => void | Promise<void>;
+    onDownload: (image: GeneratedImage, index: number) => void;
+    onCopyLink: (image: GeneratedImage, index: number) => void | Promise<void>;
+    linkingImageId: string;
+}) {
+    const sortedLogs = sortLogVersions(logs);
     return (
-        <div className={`absolute z-10 flex items-center gap-1 rounded-md bg-black/55 p-1 shadow-sm backdrop-blur ${className}`}>
-            {visibleReferences.map((item) => (
-                <img key={item.id} src={item.dataUrl} alt={item.name} className="size-7 rounded border border-white/60 object-cover" />
-            ))}
-            {(references || []).length > visibleReferences.length ? <span className="px-1 text-[10px] text-white">+{(references || []).length - visibleReferences.length}</span> : null}
-        </div>
+        <Modal title={`历史版本（${sortedLogs.length}）`} open={open} width={960} footer={null} onCancel={onClose}>
+            {sortedLogs.length ? (
+                <div className="grid max-h-[70vh] gap-3 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+                    {sortedLogs.map((historyLog) => {
+                        const image = historyLog.images.find((item) => Boolean(item.dataUrl));
+                        const isCurrent = historyLog.id === currentLogId;
+                        return (
+                            <div key={historyLog.id} className={cn("overflow-hidden rounded-xl border bg-background dark:bg-stone-950", isCurrent ? "border-sky-500 shadow-[0_0_0_1px_rgba(14,165,233,.35)]" : "border-stone-200 dark:border-stone-800")}>
+                                <div className="relative aspect-square bg-stone-100 dark:bg-stone-900">
+                                    <div className="absolute left-2 top-2 z-10 flex flex-wrap gap-1">
+                                        <Tag className="m-0 text-[10px]" color={isCurrent ? "blue" : "default"}>
+                                            版本 {resolveLogVersionNo(historyLog)}
+                                        </Tag>
+                                        {isCurrent ? (
+                                            <Tag className="m-0 text-[10px]" color="processing">
+                                                当前
+                                            </Tag>
+                                        ) : null}
+                                        {historyLog.retryOfVersionNo ? <Tag className="m-0 text-[10px]">由 V{historyLog.retryOfVersionNo} 重试</Tag> : null}
+                                    </div>
+                                    {image ? (
+                                        <Image src={image.dataUrl} alt={`版本 ${resolveLogVersionNo(historyLog)}`} wrapperStyle={fullImageWrapperStyle} style={fullImageContainStyle} />
+                                    ) : (
+                                        <div className="flex size-full flex-col items-center justify-center gap-2 p-5 text-center text-sm text-red-500">
+                                            <AlertCircle className="size-7" />
+                                            <span>{historyLog.errors[0] || "没有可显示的图片"}</span>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="space-y-2 border-t border-stone-200 p-3 text-xs dark:border-stone-800">
+                                    <div className="flex flex-wrap items-center gap-1 text-[11px] text-stone-500 dark:text-stone-400">
+                                        <span>{formatLogTime(historyLog.createdAt)}</span>
+                                        <span>{formatDuration(historyLog.durationMs)}</span>
+                                        <Tag className="m-0 text-[10px]" color={historyLog.failCount ? "red" : "green"}>
+                                            {historyLog.status}
+                                        </Tag>
+                                    </div>
+                                    <div className="line-clamp-2 whitespace-pre-wrap text-stone-700 dark:text-stone-200">{historyLog.prompt}</div>
+                                    <div className="flex flex-wrap gap-1">
+                                        <Button size="small" onClick={() => onPreviewLog(historyLog)}>
+                                            载入
+                                        </Button>
+                                        <Button size="small" icon={<RotateCcw className="size-3.5" />} onClick={() => onRetryLog(historyLog)}>
+                                            重试
+                                        </Button>
+                                        <Button size="small" icon={<Copy className="size-3.5" />} onClick={() => void onCopyPrompt(historyLog.prompt)}>
+                                            复制
+                                        </Button>
+                                        <Button size="small" loading={Boolean(image && linkingImageId === image.id)} icon={<Link2 className="size-3.5" />} disabled={!image} onClick={() => image && void onCopyLink(image, 0)} />
+                                        <Button size="small" icon={<Download className="size-3.5" />} disabled={!image} onClick={() => image && onDownload(image, 0)} />
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            ) : (
+                <Empty description="暂无历史版本" />
+            )}
+        </Modal>
     );
 }
 
@@ -3289,7 +4690,7 @@ function createPendingResult(
     id: string,
     snapshot: RequestSnapshot,
     status: "waiting" | "running" = "waiting",
-    overrides?: Partial<Pick<GenerationResult, "createdAt" | "startedAt" | "logId">>,
+    overrides?: Partial<Pick<GenerationResult, "createdAt" | "startedAt" | "logId" | "versionGroupId" | "versionNo" | "retryOfLogId" | "retryOfVersionNo">>,
 ): GenerationResult {
     const createdAt = overrides?.createdAt || Date.now();
     return {
@@ -3302,6 +4703,10 @@ function createPendingResult(
         config: snapshot.displayConfig,
         references: snapshot.references,
         logId: overrides?.logId,
+        versionGroupId: overrides?.versionGroupId,
+        versionNo: overrides?.versionNo,
+        retryOfLogId: overrides?.retryOfLogId,
+        retryOfVersionNo: overrides?.retryOfVersionNo,
     };
 }
 
@@ -3330,11 +4735,52 @@ function buildHistoryProductPackages(logs: GenerationLog[]) {
         .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+function buildPackageItemHistoryMap(logs: GenerationLog[], packageId: string) {
+    const groups = new Map<number, GenerationLog[]>();
+    logs.filter((log) => isProductPackageHistoryLog(log) && historyProductPackageKey(log) === packageId).forEach((log) => {
+        const index = resolveHistorySeriesIndex(log);
+        if (!index) return;
+        groups.set(index, [...(groups.get(index) || []), log]);
+    });
+    groups.forEach((items, index) => groups.set(index, sortPackageItemHistoryLogs(items)));
+    return groups;
+}
+
+function packageItemHistoryLogs(logs: GenerationLog[], packageId: string, itemIndex: number) {
+    return sortPackageItemHistoryLogs(logs.filter((log) => isProductPackageHistoryLog(log) && historyProductPackageKey(log) === packageId && resolveHistorySeriesIndex(log) === itemIndex));
+}
+
+function sortPackageItemHistoryLogs(logs: GenerationLog[]) {
+    return [...logs].sort((a, b) => resolveLogVersionNo(a) - resolveLogVersionNo(b) || a.createdAt - b.createdAt);
+}
+
+function packageItemVersionGroupId(packageId: string, itemIndex: number) {
+    return `${packageId}:${itemIndex}`;
+}
+
+function buildPackageItemRetryVersionMeta(packageId: string, itemIndex: number, sourceLog: GenerationLog | undefined, historyLogs: GenerationLog[]) {
+    const versionGroupId = sourceLog?.versionGroupId || packageItemVersionGroupId(packageId, itemIndex);
+    const relatedLogs = historyLogs.filter((log) => (log.versionGroupId || packageItemVersionGroupId(historyProductPackageKey(log), resolveHistorySeriesIndex(log))) === versionGroupId);
+    const maxVersionNo = Math.max(1, ...relatedLogs.map(resolveLogVersionNo), ...(sourceLog ? [resolveLogVersionNo(sourceLog)] : []));
+    return {
+        versionGroupId,
+        nextVersionNo: maxVersionNo + 1,
+        retryOfLogId: sourceLog?.id,
+        retryOfVersionNo: sourceLog ? resolveLogVersionNo(sourceLog) : undefined,
+    };
+}
+
+function resolvePackageHistoryVersionLabel(log: GenerationLog, fallbackIndex: number) {
+    const versionNo = Number(log.versionNo);
+    return `版本 ${Number.isFinite(versionNo) && versionNo > 0 ? Math.floor(versionNo) : fallbackIndex + 1}`;
+}
+
 function buildHistoryProductPackage(packageId: string, packageLogs: GenerationLog[]): ProductImagePackage | null {
     const logs = [...packageLogs].sort((a, b) => resolveHistorySeriesIndex(a) - resolveHistorySeriesIndex(b) || a.createdAt - b.createdAt);
     const firstLog = logs[0];
     if (!firstLog) return null;
-    const maxIndex = Math.max(16, ...logs.map(resolveHistorySeriesIndex));
+    const isFolderPackage = firstLog.workflowId === folderPackageWorkflowId;
+    const maxIndex = Math.max(isFolderPackage ? 1 : 16, ...logs.map(resolveHistorySeriesIndex));
     const itemByIndex = new Map<number, ProductPackageItem>();
     logs.forEach((log) => {
         const index = resolveHistorySeriesIndex(log);
@@ -3348,7 +4794,7 @@ function buildHistoryProductPackage(packageId: string, packageLogs: GenerationLo
         id: packageId,
         workflowId: firstLog.workflowId || "",
         workflowName: firstLog.workflowName || "工作流",
-        packageName: `${productName || firstLog.workflowName || "产品"}-产品图包`,
+        packageName: isFolderPackage ? `${productName || firstLog.workflowName || "产品"}-套图生成` : `${productName || firstLog.workflowName || "产品"}-产品图包`,
         productName,
         inputs,
         references: firstLog.references || [],
@@ -3366,12 +4812,13 @@ function buildHistoryProductPackage(packageId: string, packageLogs: GenerationLo
 
 function buildHistoryPackageItem(packageId: string, log: GenerationLog, index: number): ProductPackageItem {
     const image = log.images[0];
+    const group = resolveHistoryPackageGroup(log, index);
     return {
         id: `${packageId}:${index}`,
         logId: log.id,
-        group: packageGroupFromIndex(index),
+        group,
         index,
-        groupIndex: packageGroupIndex(index),
+        groupIndex: resolveHistoryGroupIndex(log, index),
         title: resolveHistorySeriesTitle(log, index),
         prompt: log.prompt,
         model: log.model || log.config.imageModel || log.config.model,
@@ -3384,6 +4831,8 @@ function buildHistoryPackageItem(packageId: string, log: GenerationLog, index: n
         startedAt: log.createdAt,
         endedAt: log.createdAt + (log.durationMs || 0),
         durationMs: log.durationMs,
+        sourceFolderName: typeof log.workflowInputs?.sourceFolderName === "string" ? log.workflowInputs.sourceFolderName : undefined,
+        sourceFileName: typeof log.workflowInputs?.sourceFileName === "string" ? log.workflowInputs.sourceFileName : undefined,
     };
 }
 
@@ -3409,7 +4858,7 @@ function isProductPackageHistoryLog(log: GenerationLog) {
         .map((value) => String(value || ""))
         .join(" ");
     const text = `${log.workflowName || ""} ${log.title || ""} ${inputText}`.toLowerCase();
-    return /图包|主图|副图|详情图|保健|健康|消字号|产品|product package/.test(text);
+    return /图包|套图|主图|副图|详情图|sku|保健|健康|消字号|产品|product package/.test(text);
 }
 
 function historyProductPackageKey(log: GenerationLog) {
@@ -3437,6 +4886,16 @@ function resolveHistorySeriesTitle(log: GenerationLog, index: number) {
     const raw = log.workflowInputs?.seriesTitle;
     const title = typeof raw === "string" ? raw.trim() : "";
     return title || defaultPackageItemTitle(index);
+}
+
+function resolveHistoryPackageGroup(log: GenerationLog, index: number): ProductPackageGroup {
+    const group = log.workflowInputs?.seriesGroup;
+    return isProductPackageGroup(group) ? group : packageGroupFromIndex(index);
+}
+
+function resolveHistoryGroupIndex(log: GenerationLog, index: number) {
+    const raw = Number(log.workflowInputs?.groupIndex);
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : packageGroupIndex(index);
 }
 
 function upsertProductPackageTask(packages: ProductImagePackage[], task: WorkflowExternalTaskStart, configSnapshot: GenerationLogConfig, packageId: string): ProductImagePackage[] {
@@ -3509,6 +4968,10 @@ function packageGroupFromIndex(index: number): ProductPackageGroup {
     return "detail";
 }
 
+function isProductPackageGroup(value: unknown): value is ProductPackageGroup {
+    return typeof value === "string" && packageGroupOrder.includes(value as ProductPackageGroup);
+}
+
 function packageGroupIndex(index: number) {
     if (index === 1) return 1;
     if (index <= 5) return index - 1;
@@ -3546,19 +5009,7 @@ function buildPackageQuickStartInputs(draft: PackageQuickStartDraft) {
     };
 }
 
-function createQuickStartPackageItems({
-    packageId,
-    draft,
-    references,
-    model,
-    config,
-}: {
-    packageId: string;
-    draft: PackageQuickStartDraft;
-    references: ReferenceImage[];
-    model: string;
-    config: GenerationLogConfig;
-}) {
+function createQuickStartPackageItems({ packageId, draft, references, model, config }: { packageId: string; draft: PackageQuickStartDraft; references: ReferenceImage[]; model: string; config: GenerationLogConfig }) {
     const prompts = buildQuickStartPackagePrompts(draft);
     const startedAt = Date.now();
     return prompts.map((prompt, offset) => {
@@ -3655,11 +5106,13 @@ function getVisiblePackageStats(pkg: ProductImagePackage) {
 
 function getVisiblePackageGroupCounts(pkg: ProductImagePackage) {
     const items = getVisiblePackageItems(pkg);
-    return {
-        main: items.filter((item) => item.group === "main").length,
-        sub: items.filter((item) => item.group === "sub").length,
-        detail: items.filter((item) => item.group === "detail").length,
-    };
+    return packageGroupOrder.reduce(
+        (counts, group) => {
+            counts[group] = items.filter((item) => item.group === group).length;
+            return counts;
+        },
+        { main: 0, sub: 0, detail: 0, sku: 0, other: 0 } as Record<ProductPackageGroup, number>,
+    );
 }
 
 function clonePackageForRetry(packageData: ProductImagePackage): ProductImagePackage {
@@ -3674,12 +5127,38 @@ function clonePackageForRetry(packageData: ProductImagePackage): ProductImagePac
     };
 }
 
-function upsertRetriedPackage(
-    packages: ProductImagePackage[],
-    packageData: ProductImagePackage,
-    itemId: string,
-    patch: Partial<ProductPackageItem>,
-) {
+function reconcileProductPackagesAfterLogDeletion(packages: ProductImagePackage[], nextLogs: GenerationLog[], deletedLogIds: Set<string>, selectedPackageIds: Set<string> = new Set()) {
+    const nextLogIds = new Set(nextLogs.map((log) => log.id));
+    return packages.flatMap((pkg) => {
+        if (selectedPackageIds.has(pkg.id)) return [];
+        let touched = false;
+        const nextItems = pkg.items.map((item) => {
+            if (!item.logId || !deletedLogIds.has(item.logId)) return item;
+            touched = true;
+            return {
+                ...item,
+                logId: undefined,
+                taskId: undefined,
+                prompt: "",
+                status: "waiting" as const,
+                image: undefined,
+                error: undefined,
+                errorDetail: undefined,
+                startedAt: undefined,
+                endedAt: undefined,
+                durationMs: undefined,
+            };
+        });
+        if (!touched) return [pkg];
+        const hasRemainingLinkedItems = nextItems.some((item) => item.logId && nextLogIds.has(item.logId));
+        const hasActiveItems = nextItems.some((item) => item.status === "running");
+        const hasVisibleItems = nextItems.some(shouldDisplayPackageItem);
+        if (!hasRemainingLinkedItems && !hasActiveItems && !hasVisibleItems) return [];
+        return [{ ...pkg, updatedAt: Date.now(), items: nextItems }];
+    });
+}
+
+function upsertRetriedPackage(packages: ProductImagePackage[], packageData: ProductImagePackage, itemId: string, patch: Partial<ProductPackageItem>) {
     const existing = packages.find((item) => item.id === packageData.id);
     const base = existing || packageData;
     const nextPackage: ProductImagePackage = {
@@ -3695,9 +5174,7 @@ function findPackageLogForRetry(logs: GenerationLog[], packageId: string, item: 
         const exact = logs.find((log) => log.id === item.logId);
         if (exact) return exact;
     }
-    return [...logs]
-        .filter((log) => isProductPackageHistoryLog(log) && historyProductPackageKey(log) === packageId && resolveHistorySeriesIndex(log) === item.index)
-        .sort((a, b) => b.createdAt - a.createdAt)[0];
+    return [...logs].filter((log) => isProductPackageHistoryLog(log) && historyProductPackageKey(log) === packageId && resolveHistorySeriesIndex(log) === item.index).sort((a, b) => b.createdAt - a.createdAt)[0];
 }
 
 function buildPackageRetryLog({
@@ -3714,6 +5191,10 @@ function buildPackageRetryLog({
     errors,
     errorDetails,
     status,
+    versionGroupId,
+    versionNo,
+    retryOfLogId,
+    retryOfVersionNo,
 }: {
     baseLog?: GenerationLog;
     logId: string;
@@ -3728,6 +5209,10 @@ function buildPackageRetryLog({
     errors: string[];
     errorDetails: string[];
     status: GenerationLog["status"];
+    versionGroupId?: string;
+    versionNo?: number;
+    retryOfLogId?: string;
+    retryOfVersionNo?: number;
 }): GenerationLog {
     return {
         id: logId,
@@ -3752,13 +5237,21 @@ function buildPackageRetryLog({
         categoryIds: baseLog?.categoryIds || [],
         workflowId: packageData.workflowId || baseLog?.workflowId,
         workflowName: packageData.workflowName || baseLog?.workflowName,
-        workflowInputs: { ...packageData.inputs, seriesTitle: item.title, seriesIndex: item.index },
+        workflowInputs: { ...packageData.inputs, seriesTitle: item.title, seriesIndex: item.index, seriesGroup: item.group, groupIndex: item.groupIndex, sourceFolderName: item.sourceFolderName, sourceFileName: item.sourceFileName },
         workflowSeriesRunId: packageData.id || baseLog?.workflowSeriesRunId,
+        versionGroupId: versionGroupId || baseLog?.versionGroupId || packageItemVersionGroupId(packageData.id, item.index),
+        versionNo: versionNo || baseLog?.versionNo || 1,
+        retryOfLogId,
+        retryOfVersionNo,
     };
 }
 
 function generationLogStorageKeys(log: GenerationLog) {
     return [...log.images.map((image) => image.storageKey), ...log.references.filter(isDisposableReferenceFile).map((image) => image.storageKey)].filter((key): key is string => Boolean(key));
+}
+
+function generationResultStorageKeys(result: GenerationResult) {
+    return [result.image?.storageKey, ...result.references.filter(isDisposableReferenceFile).map((image) => image.storageKey)].filter((key): key is string => Boolean(key));
 }
 
 function referenceUsedByGeneration(reference: ReferenceImage, logs: GenerationLog[], results: GenerationResult[]) {
@@ -3779,6 +5272,12 @@ function isDisposableReferenceFile(reference: ReferenceImage) {
 function disposableLogStorageKeys(deletedLogs: GenerationLog[], remainingLogs: GenerationLog[], protectedKeys: Iterable<string> = []) {
     const deletedKeys = new Set(deletedLogs.flatMap(generationLogStorageKeys));
     const retainedKeys = new Set([...remainingLogs.flatMap(generationLogStorageKeys), ...protectedKeys]);
+    return [...deletedKeys].filter((key) => !retainedKeys.has(key));
+}
+
+function disposableResultStorageKeys(deletedResults: GenerationResult[], protectedKeys: Iterable<string> = []) {
+    const deletedKeys = new Set(deletedResults.flatMap(generationResultStorageKeys));
+    const retainedKeys = new Set(protectedKeys);
     return [...deletedKeys].filter((key) => !retainedKeys.has(key));
 }
 
@@ -3812,7 +5311,12 @@ function formatFailureSummaryText(value?: string) {
     if (/failed to fetch|load failed|networkerror when attempting to fetch resource/i.test(text)) {
         return "接口连接失败，请稍后重试";
     }
-    return text.split(/\r?\n/, 1)[0].replace(/^Error:\s*/, "").trim() || "生成失败";
+    return (
+        text
+            .split(/\r?\n/, 1)[0]
+            .replace(/^Error:\s*/, "")
+            .trim() || "生成失败"
+    );
 }
 
 function formatFailureDetailText(detail?: string, fallback?: string) {
@@ -3861,6 +5365,25 @@ async function replaceStoredImageHistory(logs: GenerationLog[], categories: Gene
     await categoryStore.setItem(scopedImageHistoryCategoryKey(), categories);
 }
 
+async function readStoredProductPackages() {
+    if (typeof window === "undefined") return [];
+    try {
+        const value = await packageStore.getItem<ProductImagePackage[]>(scopedProductPackageStoreKey());
+        return await normalizeProductPackages(Array.isArray(value) ? value : []);
+    } catch {
+        return [];
+    }
+}
+
+async function replaceStoredProductPackages(packages: ProductImagePackage[]) {
+    if (typeof window === "undefined") return;
+    await packageStore.setItem(scopedProductPackageStoreKey(), packages.map(serializeProductPackage));
+}
+
+function scopedProductPackageStoreKey(scope = currentImageHistoryScope()) {
+    return `${PACKAGE_STORE_KEY}:${scope}`;
+}
+
 async function clearScopedStoredLogs() {
     const scope = currentImageHistoryScope();
     const removableKeys: string[] = [];
@@ -3870,10 +5393,11 @@ async function clearScopedStoredLogs() {
     await Promise.all(removableKeys.map((key) => logStore.removeItem(key)));
 }
 
-async function imageHistorySnapshot(logs: GenerationLog[], categories: GenerationCategory[]) {
+async function imageHistorySnapshot(logs: GenerationLog[], categories: GenerationCategory[], packages: ProductImagePackage[] = []) {
     return {
         logs: await Promise.all(logs.map(buildSyncableLog)),
         categories,
+        packages: await Promise.all(packages.map(buildSyncableProductPackage)),
     };
 }
 
@@ -3894,8 +5418,7 @@ async function mergeGenerationLogs(remoteLogs: GenerationLog[], localLogs: Gener
             !existing ||
             log.createdAt > existing.createdAt ||
             (log.createdAt === existing.createdAt &&
-                (log.images.length + log.failCount > existing.images.length + existing.failCount ||
-                    (log.images.length + log.failCount === existing.images.length + existing.failCount && logImageDataScore(log) > logImageDataScore(existing))))
+                (log.images.length + log.failCount > existing.images.length + existing.failCount || (log.images.length + log.failCount === existing.images.length + existing.failCount && logImageDataScore(log) > logImageDataScore(existing))))
         ) {
             byId.set(log.id, log);
         }
@@ -3911,13 +5434,98 @@ function mergeGenerationCategories(remoteCategories: GenerationCategory[], local
     return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt);
 }
 
+async function normalizeProductPackages(packages: Partial<ProductImagePackage>[]) {
+    const normalized = await Promise.all(packages.map(normalizeProductPackage));
+    return normalized.filter((pkg): pkg is ProductImagePackage => Boolean(pkg)).sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+async function normalizeProductPackage(pkg: Partial<ProductImagePackage>): Promise<ProductImagePackage | null> {
+    if (!pkg?.id) return null;
+    const references = await normalizeStoredReferences(pkg.references);
+    const items = await Promise.all((pkg.items || []).map((item, index) => normalizeProductPackageItem(pkg.id || "", item, index + 1, references)));
+    const visibleItems = items.filter((item): item is ProductPackageItem => Boolean(item));
+    if (!visibleItems.length) return null;
+    const createdAt = Number(pkg.createdAt) || Date.now();
+    return {
+        id: pkg.id,
+        workflowId: pkg.workflowId || folderPackageWorkflowId,
+        workflowName: pkg.workflowName || "文件夹套图生成",
+        packageName: pkg.packageName || `${pkg.productName || "未命名产品"}-套图生成`,
+        productName: pkg.productName || resolvePackageProductName(pkg.inputs) || "未命名产品",
+        inputs: normalizePackageInputs(pkg.inputs),
+        references,
+        model: pkg.model || pkg.config?.imageModel || pkg.config?.model || visibleItems[0]?.model || "",
+        config: normalizeLogConfig({ config: pkg.config, model: pkg.model || visibleItems[0]?.model || "", imageCount: pkg.totalCount || visibleItems.length }),
+        createdAt,
+        updatedAt: Number(pkg.updatedAt) || createdAt,
+        totalCount: Math.max(Number(pkg.totalCount) || 0, visibleItems.length),
+        items: visibleItems,
+    };
+}
+
+async function normalizeProductPackageItem(packageId: string, item: Partial<ProductPackageItem>, fallbackIndex: number, packageReferences: ReferenceImage[]): Promise<ProductPackageItem | null> {
+    const index = Number(item.index) > 0 ? Math.floor(Number(item.index)) : fallbackIndex;
+    const group = isProductPackageGroup(item.group) ? item.group : packageGroupFromIndex(index);
+    const itemReferences = await normalizeStoredReferences(item.references);
+    const references = itemReferences.length ? itemReferences : packageReferences;
+    const image = item.image ? await hydrateStoredHistoryImage(item.image) : undefined;
+    const status = isProductPackageItemStatus(item.status) ? item.status : image?.dataUrl ? "success" : "waiting";
+    return {
+        id: item.id || `${packageId}:${index}`,
+        logId: item.logId,
+        taskId: item.taskId,
+        selected: Boolean(item.selected),
+        group,
+        index,
+        groupIndex: Number(item.groupIndex) > 0 ? Math.floor(Number(item.groupIndex)) : packageGroupIndex(index),
+        title: item.title || defaultPackageItemTitle(index),
+        prompt: item.prompt || "",
+        model: item.model || "",
+        config: normalizeLogConfig({ config: item.config, model: item.model || "", imageCount: 1 }),
+        references,
+        status,
+        image: image?.dataUrl ? image : undefined,
+        error: item.error,
+        errorDetail: item.errorDetail,
+        startedAt: item.startedAt,
+        endedAt: item.endedAt,
+        durationMs: item.durationMs,
+        sourceFolderName: item.sourceFolderName,
+        sourceFileName: item.sourceFileName,
+    };
+}
+
+async function normalizeStoredReferences(references?: Partial<ReferenceImage>[]): Promise<ReferenceImage[]> {
+    const normalized: Array<ReferenceImage | null> = await Promise.all(
+        (references || []).map(async (item, index) => {
+            if (!item?.dataUrl && !item?.storageKey) return null;
+            const reference: ReferenceImage = {
+                id: item.id || nanoid(),
+                name: item.name || `参考图-${index + 1}`,
+                type: item.type || "image/png",
+                dataUrl: item.dataUrl || "",
+                storageKey: item.storageKey,
+                width: item.width,
+                height: item.height,
+                bytes: item.bytes,
+                source: item.source || "upload",
+                assetId: item.assetId,
+                temporary: item.temporary,
+            };
+            const hydrated = await hydrateStoredHistoryImage(reference);
+            return hydrated.dataUrl ? hydrated : null;
+        }),
+    );
+    return normalized.filter((item): item is ReferenceImage => item !== null);
+}
+
+function isProductPackageItemStatus(value: unknown): value is ProductPackageItemStatus {
+    return value === "waiting" || value === "running" || value === "success" || value === "failed";
+}
+
 async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
-    const references = await Promise.all(
-        (log.references || []).map((item) => hydrateStoredHistoryImage(item)),
-    );
-    const images = await Promise.all(
-        (log.images || []).map((item) => hydrateStoredHistoryImage(item)),
-    );
+    const references = await Promise.all((log.references || []).map((item) => hydrateStoredHistoryImage(item)));
+    const images = await Promise.all((log.images || []).map((item) => hydrateStoredHistoryImage(item)));
     const visibleImages = images.filter((image) => Boolean(image.dataUrl));
     const config = normalizeLogConfig(log);
     const rawSuccessCount = log.successCount ?? log.imageCount ?? 0;
@@ -3955,6 +5563,10 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         workflowName: log.workflowName,
         workflowInputs: log.workflowInputs,
         workflowSeriesRunId: log.workflowSeriesRunId,
+        versionGroupId: typeof log.versionGroupId === "string" && log.versionGroupId ? log.versionGroupId : undefined,
+        versionNo: Number.isFinite(Number(log.versionNo)) && Number(log.versionNo) > 0 ? Math.floor(Number(log.versionNo)) : undefined,
+        retryOfLogId: typeof log.retryOfLogId === "string" && log.retryOfLogId ? log.retryOfLogId : undefined,
+        retryOfVersionNo: Number.isFinite(Number(log.retryOfVersionNo)) && Number(log.retryOfVersionNo) > 0 ? Math.floor(Number(log.retryOfVersionNo)) : undefined,
     };
 }
 
@@ -3990,6 +5602,22 @@ function serializeLog(log: GenerationLog): GenerationLog {
     };
 }
 
+function serializeProductPackage(pkg: ProductImagePackage): ProductImagePackage {
+    return {
+        ...pkg,
+        references: pkg.references.map(serializeReferenceImage),
+        items: pkg.items.map((item) => ({
+            ...item,
+            references: item.references.map(serializeReferenceImage),
+            image: item.image ? { ...item.image, dataUrl: persistableImageUrl(item.image.dataUrl, item.image.storageKey) } : undefined,
+        })),
+    };
+}
+
+function serializeReferenceImage(reference: ReferenceImage): ReferenceImage {
+    return { ...reference, dataUrl: persistableImageUrl(reference.dataUrl, reference.storageKey) };
+}
+
 function persistableImageUrl(dataUrl?: string, storageKey?: string) {
     if (storageKey?.startsWith("server:")) return "";
     if (storageKey?.startsWith("image:")) return dataUrl?.startsWith("data:image/") ? dataUrl : "";
@@ -4004,6 +5632,24 @@ async function buildSyncableLog(log: GenerationLog): Promise<GenerationLog> {
         images: await Promise.all(log.images.map(async (image) => ({ ...image, dataUrl: await syncableImageUrl(image.dataUrl, image.storageKey) }))),
         thumbnails: await Promise.all(log.images.map((image) => syncableImageUrl(image.dataUrl, image.storageKey))),
     };
+}
+
+async function buildSyncableProductPackage(pkg: ProductImagePackage): Promise<ProductImagePackage> {
+    return {
+        ...pkg,
+        references: await Promise.all(pkg.references.map(syncableReferenceImage)),
+        items: await Promise.all(
+            pkg.items.map(async (item) => ({
+                ...item,
+                references: await Promise.all(item.references.map(syncableReferenceImage)),
+                image: item.image ? { ...item.image, dataUrl: await syncableImageUrl(item.image.dataUrl, item.image.storageKey) } : undefined,
+            })),
+        ),
+    };
+}
+
+async function syncableReferenceImage(reference: ReferenceImage): Promise<ReferenceImage> {
+    return { ...reference, dataUrl: await syncableImageUrl(reference.dataUrl, reference.storageKey) };
 }
 
 async function syncableImageUrl(dataUrl?: string, storageKey?: string) {
@@ -4078,6 +5724,32 @@ function buildSingleResultLogConfig(config: GenerationLogConfig): GenerationLogC
     return { ...config, count: "1" };
 }
 
+async function buildReferenceScopedSnapshot(snapshot: RequestSnapshot, reference: ReferenceImage): Promise<RequestSnapshot> {
+    const referenceSize = await resolveReferenceOutputSize(reference, snapshot.displayConfig.size);
+    if (!referenceSize) return { ...snapshot, references: [reference] };
+    return {
+        ...snapshot,
+        requestConfig: { ...snapshot.requestConfig, size: referenceSize },
+        displayConfig: { ...snapshot.displayConfig, size: referenceSize },
+        references: [reference],
+    };
+}
+
+async function resolveReferenceOutputSize(_reference: ReferenceImage, baseSize: string | undefined) {
+    const requestedSize = (baseSize || "").trim();
+    if (requestedSize && requestedSize !== "auto") return requestedSize;
+    return "";
+}
+
+function parsePixelSize(value?: string) {
+    const match = `${value || ""}`.trim().match(/^(\d+)x(\d+)$/);
+    if (!match) return null;
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+    return { width, height };
+}
+
 function imageExtension(value: string) {
     const lower = value.toLowerCase();
     if (lower.includes("jpeg") || lower.includes("jpg")) return "jpg";
@@ -4086,7 +5758,13 @@ function imageExtension(value: string) {
 }
 
 function safeFileName(value: string) {
-    return value.replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim().slice(0, 80) || "未命名";
+    return (
+        value
+            .replace(/[\\/:*?"<>|]+/g, "_")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 80) || "未命名"
+    );
 }
 
 function defaultWorkflowButtonPosition() {
@@ -4099,6 +5777,52 @@ function clampWorkflowButtonPosition(position: { x?: number; y?: number }) {
     return {
         x: Math.min(Math.max(12, Number(position.x) || 12), Math.max(12, window.innerWidth - 120)),
         y: Math.min(Math.max(72, Number(position.y) || 72), Math.max(72, window.innerHeight - 64)),
+    };
+}
+
+function resolveLogVersionGroupId(log: GenerationLog) {
+    return log.versionGroupId || log.id;
+}
+
+function resolveResultVersionGroupId(result: GenerationResult) {
+    return result.versionGroupId || result.logId || result.id;
+}
+
+function resolveLogVersionNo(log: GenerationLog) {
+    const versionNo = Number(log.versionNo);
+    return Number.isFinite(versionNo) && versionNo > 0 ? Math.floor(versionNo) : 1;
+}
+
+function sortLogVersions(logs: GenerationLog[]) {
+    return [...logs].sort((a, b) => resolveLogVersionNo(a) - resolveLogVersionNo(b) || a.createdAt - b.createdAt);
+}
+
+function buildLogVersionGroups(logs: GenerationLog[]) {
+    const groups = new Map<string, GenerationLog[]>();
+    logs.forEach((log) => {
+        const groupId = resolveLogVersionGroupId(log);
+        groups.set(groupId, [...(groups.get(groupId) || []), log]);
+    });
+    groups.forEach((items, groupId) => groups.set(groupId, sortLogVersions(items)));
+    return groups;
+}
+
+function latestLogsByVersionGroup(logs: GenerationLog[]) {
+    return [...buildLogVersionGroups(logs).values()]
+        .map((items) => items[items.length - 1])
+        .filter((item): item is GenerationLog => Boolean(item))
+        .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+function buildRetryVersionMeta(sourceLog: GenerationLog, allLogs: GenerationLog[]) {
+    const versionGroupId = resolveLogVersionGroupId(sourceLog);
+    const groupLogs = allLogs.filter((log) => resolveLogVersionGroupId(log) === versionGroupId);
+    const nextVersionNo = Math.max(resolveLogVersionNo(sourceLog), ...groupLogs.map(resolveLogVersionNo), 1) + 1;
+    return {
+        versionGroupId,
+        nextVersionNo,
+        retryOfLogId: sourceLog.id,
+        retryOfVersionNo: resolveLogVersionNo(sourceLog),
     };
 }
 
@@ -4117,6 +5841,10 @@ function buildLog({
     errors,
     errorDetails,
     categoryIds,
+    versionGroupId,
+    versionNo,
+    retryOfLogId,
+    retryOfVersionNo,
 }: {
     id?: string;
     createdAt?: number;
@@ -4132,6 +5860,10 @@ function buildLog({
     errors: string[];
     errorDetails?: string[];
     categoryIds?: string[];
+    versionGroupId?: string;
+    versionNo?: number;
+    retryOfLogId?: string;
+    retryOfVersionNo?: number;
 }): GenerationLog {
     const logConfig = config;
     return {
@@ -4155,6 +5887,10 @@ function buildLog({
         errors,
         errorDetails,
         categoryIds: categoryIds || [],
+        versionGroupId,
+        versionNo,
+        retryOfLogId,
+        retryOfVersionNo,
     };
 }
 

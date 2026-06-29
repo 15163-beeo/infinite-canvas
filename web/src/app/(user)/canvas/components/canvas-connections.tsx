@@ -44,7 +44,7 @@ export function ConnectionPath({
                 data-connection-id={connection.id}
                 d={pathD}
                 stroke="transparent"
-                strokeWidth="16"
+                strokeWidth="20"
                 fill="none"
                 style={{ cursor: "pointer", pointerEvents: "stroke" }}
                 onMouseEnter={() => setHovered(true)}
@@ -57,8 +57,18 @@ export function ConnectionPath({
             <path
                 d={pathD}
                 stroke={active ? theme.node.activeStroke : theme.node.muted}
-                strokeWidth={active ? 3 : 2}
-                strokeOpacity={active ? 1 : 0.82}
+                strokeWidth={active ? 8 : 6}
+                strokeOpacity={active ? 0.16 : 0.1}
+                strokeLinecap="round"
+                fill="none"
+                style={{ pointerEvents: "none" }}
+            />
+            <path
+                d={pathD}
+                stroke={active ? theme.node.activeStroke : theme.node.muted}
+                strokeWidth={active ? 4 : 3}
+                strokeOpacity={active ? 1 : 0.88}
+                strokeLinecap="round"
                 fill="none"
                 style={{ filter: active ? `drop-shadow(0 0 8px ${theme.node.activeStroke}66)` : undefined, pointerEvents: "none" }}
             />
@@ -110,9 +120,15 @@ export function ActiveConnectionPath({ node, handle, mouseWorld }: { node?: Canv
     const endX = handle.handleType === "source" ? mouseWorld.x : node.position.x;
     const endY = handle.handleType === "source" ? mouseWorld.y : node.position.y + node.height / 2;
     const distance = Math.abs(endX - startX);
-    const pathD = `M ${startX} ${startY} C ${startX + distance * 0.5} ${startY}, ${endX - distance * 0.5} ${endY}, ${endX} ${endY}`;
+    const curvature = Math.max(distance * 0.5, 56);
+    const pathD = `M ${startX} ${startY} C ${startX + curvature} ${startY}, ${endX - curvature} ${endY}, ${endX} ${endY}`;
 
-    return <path d={pathD} stroke={theme.node.activeStroke} strokeWidth="2" fill="none" strokeDasharray="5,5" />;
+    return (
+        <>
+            <path d={pathD} stroke={theme.node.activeStroke} strokeWidth="10" strokeOpacity="0.14" strokeLinecap="round" fill="none" />
+            <path d={pathD} stroke={theme.node.activeStroke} strokeWidth="4" strokeOpacity="0.96" strokeLinecap="round" fill="none" strokeDasharray="8 7" />
+        </>
+    );
 }
 
 function cubicBezierPoint(t: number, p0: Position, p1: Position, p2: Position, p3: Position) {

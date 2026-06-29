@@ -3,7 +3,7 @@ FROM oven/bun:1.3.13 AS web-build
 
 WORKDIR /app/web
 COPY web/package.json web/bun.lock ./
-RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lockfile --registry=https://registry.npmmirror.com --cache-dir=/root/.bun/install/cache
+RUN --mount=type=cache,target=/root/.bun/install/cache bun install --registry=https://registry.npmmirror.com --cache-dir=/root/.bun/install/cache
 COPY VERSION /app/VERSION
 COPY CHANGELOG.md /app/CHANGELOG.md
 COPY web ./
@@ -25,16 +25,21 @@ COPY service ./service
 COPY main.go ./
 RUN go build -o /server .
 
+# 预装去背景/智能分层所需 Python 依赖。
+FROM python:3.11-slim-bookworm AS pydeps-build
+
+WORKDIR /app
+COPY tools/remove_background_requirements.txt /app/tools/remove_background_requirements.txt
+RUN python -m pip install --no-cache-dir -r /app/tools/remove_background_requirements.txt -t /app/.local/pydeps
+
 # 运行镜像：Next.js 对外监听 13000，Go 只在容器内部监听 18080。
 FROM node:22-bookworm-slim
 
 ARG DEBIAN_MIRROR=http://mirrors.aliyun.com
 WORKDIR /app
-COPY VERSION /app/VERSION
-COPY CHANGELOG.md /app/CHANGELOG.md
-COPY --from=api-build /server /app/server
-COPY --from=web-build /app/web /app/web
 ENV PROMPT_DATA_DIR=/app/data/prompts
+ENV REMOVE_BG_PYTHON=python3
+ENV REMOVE_BG_PYTHONPATH=/app/.local/pydeps
 RUN set -eux; \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i \
@@ -48,8 +53,14 @@ RUN set -eux; \
             /etc/apt/sources.list; \
     fi; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates; \
+    apt-get install -y --no-install-recommends ca-certificates python3 libglib2.0-0 libgomp1; \
     rm -rf /var/lib/apt/lists/*
+COPY VERSION /app/VERSION
+COPY CHANGELOG.md /app/CHANGELOG.md
+COPY --from=api-build /server /app/server
+COPY --from=pydeps-build /app/.local /app/.local
+COPY --from=web-build /app/web /app/web
+COPY tools /app/tools
 RUN mkdir -p /app/data/prompts
 
 EXPOSE 13000

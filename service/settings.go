@@ -113,8 +113,12 @@ func normalizePublicSetting(setting model.PublicSetting) model.PublicSetting {
 		enabled := true
 		setting.Auth.AllowRegister = &enabled
 	}
+	if setting.Auth.RequireInviteCode == nil {
+		enabled := false
+		setting.Auth.RequireInviteCode = &enabled
+	}
 	if setting.Storage.Mode == "" {
-		setting.Storage.Mode = "local_indexeddb"
+		setting.Storage.Mode = "server_local"
 	}
 	return setting
 }
@@ -210,7 +214,7 @@ func DefaultSystemPrompts() model.SystemPromptSetting {
 
 func normalizePrivateStorageSetting(setting model.PrivateStorageSetting) model.PrivateStorageSetting {
 	if setting.Mode == "" {
-		setting.Mode = "local_indexeddb"
+		setting.Mode = "server_local"
 	}
 	if setting.CapacityLimitBytes <= 0 {
 		setting.CapacityLimitBytes = 9 * 1024 * 1024 * 1024
@@ -462,6 +466,16 @@ func testAdminChannelModel(channel model.ModelChannel, modelName string) (string
 	if strings.TrimSpace(modelName) == "" {
 		return "", errors.New("缺少模型名称")
 	}
+	if isAdminImageModel(modelName) {
+		models, err := fetchAdminChannelModels(channel)
+		if err != nil {
+			return "", err
+		}
+		if len(models) == 0 || stringSliceContains(models, strings.TrimSpace(modelName)) {
+			return "图片模型可用", nil
+		}
+		return "", safeMessageError{message: fmt.Sprintf("模型列表中未找到 %s", strings.TrimSpace(modelName))}
+	}
 	body, _ := json.Marshal(map[string]any{
 		"model": modelName,
 		"messages": []map[string]string{{
@@ -496,6 +510,20 @@ func testAdminChannelModel(channel model.ModelChannel, modelName string) (string
 		return payload.Choices[0].Message.Content, nil
 	}
 	return "ok", nil
+}
+
+func isAdminImageModel(modelName string) bool {
+	name := strings.ToLower(strings.TrimSpace(modelName))
+	return strings.Contains(name, "image") || strings.Contains(name, "dall-e") || strings.Contains(name, "grok-imagine")
+}
+
+func stringSliceContains(items []string, value string) bool {
+	for _, item := range items {
+		if strings.TrimSpace(item) == value {
+			return true
+		}
+	}
+	return false
 }
 
 func readAdminChannelError(body []byte, statusCode int, fallback string) error {

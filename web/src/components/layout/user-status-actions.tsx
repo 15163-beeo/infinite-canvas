@@ -17,6 +17,7 @@ import { useUserStore } from "@/stores/use-user-store";
 type UserStatusActionsProps = {
     showConfig?: boolean;
     variant?: "default" | "canvas";
+    orientation?: "horizontal" | "vertical";
     onOpenShortcuts?: () => void;
     accountOpen?: boolean;
     onAccountOpenChange?: (open: boolean) => void;
@@ -24,7 +25,7 @@ type UserStatusActionsProps = {
     getPopupContainer?: (node: HTMLElement) => HTMLElement;
 };
 
-export function UserStatusActions({ showConfig = true, variant = "default", onOpenShortcuts, accountOpen, onAccountOpenChange, accountRef, getPopupContainer }: UserStatusActionsProps) {
+export function UserStatusActions({ showConfig = true, variant = "default", orientation = "horizontal", onOpenShortcuts, accountOpen, onAccountOpenChange, accountRef, getPopupContainer }: UserStatusActionsProps) {
     const router = useRouter();
     const pathname = usePathname();
     const theme = useThemeStore((state) => state.theme);
@@ -55,7 +56,7 @@ export function UserStatusActions({ showConfig = true, variant = "default", onOp
     ];
 
     return (
-        <div className="inline-flex shrink-0 items-center gap-1.5">
+        <div className={orientation === "vertical" ? "flex shrink-0 flex-col items-center gap-2" : "inline-flex shrink-0 items-center gap-1.5"}>
             {showConfig ? (
                 <button type="button" className={naturalIconClass} style={iconStyle} onClick={() => openConfigDialog(false)} aria-label="配置" title="配置">
                     <Settings2 className="size-4" />

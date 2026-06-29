@@ -29,15 +29,20 @@ func New() *gin.Engine {
 	api.GET("/files/:id/content", func(c *gin.Context) {
 		handler.FileContent(c.Writer, c.Request, c.Param("id"))
 	})
+	api.GET("/image-links/:id", func(c *gin.Context) {
+		handler.ImageLinkContent(c.Writer, c.Request, c.Param("id"))
+	})
 	v1 := api.Group("/v1", middleware.UserAuth)
 	v1.POST("/images/generations", gin.WrapF(handler.AIImagesGenerations))
 	v1.POST("/images/edits", gin.WrapF(handler.AIImagesEdits))
+	v1.POST("/uploads/images", gin.WrapF(handler.AIUploadImage))
 	v1.POST("/images/layer-image", gin.WrapF(handler.LayerImage))
 	v1.POST("/images/remove-background", gin.WrapF(handler.RemoveBackground))
 	v1.POST("/chat/completions", gin.WrapF(handler.AIChatCompletions))
 	v1.POST("/responses", gin.WrapF(handler.AIResponses))
 	v1.POST("/videos", gin.WrapF(handler.AIVideos))
 	v1.POST("/files", gin.WrapF(handler.UploadFile))
+	v1.POST("/image-links", gin.WrapF(handler.CreateImageLink))
 	v1.DELETE("/files/:id", func(c *gin.Context) {
 		handler.DeleteFile(c.Writer, c.Request, c.Param("id"))
 	})
@@ -63,6 +68,9 @@ func New() *gin.Engine {
 	})
 	v1.GET("/videos/:id/content", func(c *gin.Context) {
 		handler.AIVideoContent(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/tasks/:id", func(c *gin.Context) {
+		handler.AITask(c.Writer, c.Request, c.Param("id"))
 	})
 	api.GET("/prompts", middleware.OptionalAuth, gin.WrapF(handler.Prompts))
 	api.GET("/assets", middleware.OptionalAuth, gin.WrapF(handler.Assets))

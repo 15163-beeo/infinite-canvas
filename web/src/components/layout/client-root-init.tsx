@@ -20,14 +20,16 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
     const hydrateAccountAssets = useAssetStore((state) => state.hydrateAccountAssets);
     const stopAccountAssetSync = useAssetStore((state) => state.stopAccountAssetSync);
     const isLoginPage = pathname === "/login" || pathname === "/admin/login";
+    const isStaticDemoPage = pathname === "/image-workbench-version-demo" || pathname === "/image/version-demo";
 
     useEffect(() => {
+        if (isStaticDemoPage) return;
         void loadPublicSettings();
-    }, [loadPublicSettings]);
+    }, [isStaticDemoPage, loadPublicSettings]);
 
     useEffect(() => {
-        if (!isLoginPage) void hydrateUser();
-    }, [hydrateUser, isLoginPage]);
+        if (!isLoginPage && !isStaticDemoPage) void hydrateUser();
+    }, [hydrateUser, isLoginPage, isStaticDemoPage]);
 
     useEffect(() => {
         if (token && user?.id) {

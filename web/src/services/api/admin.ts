@@ -276,6 +276,7 @@ export type AdminPublicSettings = {
     modelChannel: AdminPublicModelChannelSettings;
     auth: {
         allowRegister: boolean;
+        requireInviteCode: boolean;
         linuxDo: {
             enabled: boolean;
         };

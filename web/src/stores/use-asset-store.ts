@@ -5,13 +5,13 @@ import { persist, type PersistStorage, type StorageValue } from "zustand/middlew
 
 import { nanoid } from "nanoid";
 import { localForageStorage } from "@/lib/localforage-storage";
-import { cleanupUnusedImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
+import { canUploadImagesToServer, cleanupUnusedImages, resolveImageUrl, uploadImage } from "@/services/image-storage";
 import { cleanupUnusedMedia, resolveMediaUrl } from "@/services/file-storage";
 import { fetchUserAssetData, syncUserAssetData } from "@/services/api/user-config";
 
 export type AssetKind = "text" | "image" | "video";
 export type TextAsset = AssetBase<"text"> & { data: { content: string } };
-export type ImageAsset = AssetBase<"image"> & { data: { dataUrl: string; storageKey?: string; width: number; height: number; bytes: number; mimeType: string } };
+export type ImageAsset = AssetBase<"image"> & { data: { dataUrl: string; storageKey?: string; width: number; height: number; bytes: number; mimeType: string; shareId?: string; shareUrl?: string } };
 export type VideoAsset = AssetBase<"video"> & { data: { url: string; storageKey?: string; width: number; height: number; bytes: number; mimeType: string } };
 export type Asset = TextAsset | ImageAsset | VideoAsset;
 
@@ -36,7 +36,7 @@ type AssetStore = {
     hydrateAccountAssets: (token: string) => Promise<void>;
     syncAccountAssets: (token: string) => Promise<void>;
     stopAccountAssetSync: () => void;
-    cleanupImages: (extra?: unknown) => void;
+    cleanupImages: (extra?: unknown, deleteCandidates?: unknown) => void;
 };
 
 const ASSET_STORE_KEY = "infinite-canvas:asset_store";
@@ -75,13 +75,15 @@ export const useAssetStore = create<AssetStore>()(
                     window.setTimeout(() => scheduleAssetSync(get), 0);
                     return { assets };
                 }),
-            removeAsset: (id) =>
+            removeAsset: (id) => {
+                let removedAsset: Asset | undefined;
                 set((state) => {
-                    const assets = state.assets.filter((asset) => asset.id !== id);
-                    get().cleanupImages({ assets });
-                    window.setTimeout(() => scheduleAssetSync(get), 0);
-                    return { assets };
-                }),
+                    removedAsset = state.assets.find((asset) => asset.id === id);
+                    return { assets: state.assets.filter((asset) => asset.id !== id) };
+                });
+                get().cleanupImages(undefined, removedAsset);
+                window.setTimeout(() => scheduleAssetSync(get), 0);
+            },
             hydrateAccountAssets: async (token) => {
                 if (!token) return;
                 activeAssetSyncToken = token;
@@ -91,6 +93,9 @@ export const useAssetStore = create<AssetStore>()(
                     const remoteAssets = Array.isArray(remote?.assets) ? await Promise.all(remote.assets.map(normalizeAsset)) : [];
                     if (remoteAssets.length) {
                         set((state) => ({ assets: mergeAssets(remoteAssets, state.assets) }));
+                        window.setTimeout(() => {
+                            if (activeAssetSyncToken === token) void get().syncAccountAssets(token).catch(() => {});
+                        }, 0);
                     } else if (get().assets.length) {
                         await syncUserAssetData(token, { assets: get().assets });
                     }
@@ -107,10 +112,10 @@ export const useAssetStore = create<AssetStore>()(
                 if (syncTimer) window.clearTimeout(syncTimer);
                 syncTimer = null;
             },
-            cleanupImages: (extra) => {
+            cleanupImages: (extra, deleteCandidates) => {
                 window.setTimeout(async () => {
                     const { useCanvasStore } = await import("@/app/(user)/canvas/stores/use-canvas-store");
-                    await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
+                    await cleanupUnusedImages({ assets: get().assets, projects: useCanvasStore.getState().projects, extra }, deleteCandidates);
                     await cleanupUnusedMedia({ assets: get().assets, projects: useCanvasStore.getState().projects, extra });
                 }, 0);
             },
@@ -150,6 +155,28 @@ async function normalizeAsset(asset: Asset): Promise<Asset> {
     if (asset.kind !== "image") return asset;
     if (asset.data.storageKey) {
         const resolvedDataUrl = await resolveImageUrl(asset.data.storageKey, asset.data.dataUrl || asset.coverUrl || "");
+        if (asset.data.storageKey.startsWith("image:") && resolvedDataUrl && (await canUploadImagesToServer())) {
+            try {
+                const image = await uploadImage(resolvedDataUrl);
+                if (image.storageKey.startsWith("server:")) {
+                    return {
+                        ...asset,
+                        coverUrl: !asset.coverUrl || asset.coverUrl.startsWith("blob:") || asset.coverUrl.startsWith("data:image/") ? image.url : asset.coverUrl,
+                        data: {
+                            ...asset.data,
+                            dataUrl: image.url,
+                            storageKey: image.storageKey,
+                            width: asset.data.width || image.width,
+                            height: asset.data.height || image.height,
+                            bytes: image.bytes,
+                            mimeType: image.mimeType,
+                        },
+                    };
+                }
+            } catch {
+                // Keep the existing local reference when the old browser blob is no longer available.
+            }
+        }
         return {
             ...asset,
             coverUrl: !asset.coverUrl || asset.coverUrl.startsWith("blob:") || asset.coverUrl.startsWith("data:image/") ? resolvedDataUrl || asset.coverUrl : asset.coverUrl,

@@ -34,6 +34,7 @@ function LoginContent() {
     const isLoading = useUserStore((state) => state.isLoading);
     const linuxDoEnabled = useConfigStore((state) => state.publicSettings?.auth?.linuxDo?.enabled === true);
     const allowRegister = useConfigStore((state) => state.publicSettings?.auth?.allowRegister !== false);
+    const requireInviteCode = useConfigStore((state) => state.publicSettings?.auth?.requireInviteCode === true);
     const [mode, setMode] = useState<"login" | "register">("login");
     const redirect = normalizeRedirect(searchParams.get("redirect"));
 
@@ -65,7 +66,11 @@ function LoginContent() {
                 return;
             }
             const action = mode === "register" ? register : login;
-            await action({ username: values.username, password: values.password, inviteCode: values.inviteCode });
+            await action({
+                username: values.username,
+                password: values.password,
+                inviteCode: mode === "register" && requireInviteCode ? values.inviteCode : undefined,
+            });
             message.success(mode === "register" ? "注册成功" : "登录成功");
             router.replace(redirect);
             router.refresh();
@@ -110,9 +115,11 @@ function LoginContent() {
                             <Form.Item name="confirmPassword" label={<span className="font-medium text-stone-800 dark:text-stone-200">确认密码</span>} rules={[{ required: true, message: "请再次输入密码" }]}>
                                 <Input.Password prefix={<LockOutlined />} autoComplete="new-password" />
                             </Form.Item>
-                            <Form.Item name="inviteCode" label={<span className="font-medium text-stone-800 dark:text-stone-200">邀请码</span>} rules={[{ required: true, message: "请输入邀请码" }]}>
-                                <Input autoComplete="off" placeholder="请输入管理员发放的邀请码" />
-                            </Form.Item>
+                            {requireInviteCode ? (
+                                <Form.Item name="inviteCode" label={<span className="font-medium text-stone-800 dark:text-stone-200">邀请码</span>} rules={[{ required: true, message: "请输入邀请码" }]}>
+                                    <Input autoComplete="off" placeholder="请输入管理员发放的邀请码" />
+                                </Form.Item>
+                            ) : null}
                         </>
                     ) : null}
                     <Space orientation="vertical" size={12} style={{ width: "100%" }}>

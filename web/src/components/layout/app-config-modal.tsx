@@ -20,6 +20,8 @@ export function AppConfigModal() {
     const setConfigDialogOpen = useConfigStore((state) => state.setConfigDialogOpen);
     const clearPromptContinue = useConfigStore((state) => state.clearPromptContinue);
     const publicSettings = useConfigStore((state) => state.publicSettings);
+    const isPublicSettingsLoading = useConfigStore((state) => state.isPublicSettingsLoading);
+    const loadPublicSettings = useConfigStore((state) => state.loadPublicSettings);
     const token = useUserStore((state) => state.token);
     const effectiveConfig = useEffectiveConfig();
     const modelChannel = publicSettings?.modelChannel;
@@ -34,6 +36,11 @@ export function AppConfigModal() {
     const [measuringStorage, setMeasuringStorage] = useState(false);
     const [storageUsageText, setStorageUsageText] = useState("");
     const [saving, setSaving] = useState(false);
+
+    useEffect(() => {
+        if (!isConfigOpen || isPublicSettingsLoading || publicSettings?.modelChannel?.channels?.length) return;
+        void loadPublicSettings().catch(() => {});
+    }, [isConfigOpen, isPublicSettingsLoading, loadPublicSettings, publicSettings?.modelChannel?.channels?.length]);
 
     useEffect(() => {
         try {
@@ -71,7 +78,7 @@ export function AppConfigModal() {
             if (token && allowUserStorageProvider && config.syncStorageConfig) {
                 await syncUserStorageProvider(token, userStorage);
             }
-            
+
             if (isLocalIncomplete || isModelIncomplete) {
                 message.warning("部分通道的模型或直连密钥尚未配置完整，配置已保存并同步");
             } else {
@@ -309,13 +316,40 @@ export function AppConfigModal() {
                     )}
                     <div className="grid gap-4 md:grid-cols-3">
                         <Form.Item label="默认生图模型" className="mb-4">
-                            <ModelPicker config={modelConfig} value={modelConfig.imageModel} channelId={modelConfig.imageChannelId} onChange={(model, channelId) => { updateConfig("imageModel", model); if (channelId) updateConfig("imageChannelId", channelId); }} fullWidth />
+                            <ModelPicker
+                                config={modelConfig}
+                                value={modelConfig.imageModel}
+                                channelId={modelConfig.imageChannelId}
+                                onChange={(model, channelId) => {
+                                    updateConfig("imageModel", model);
+                                    if (channelId) updateConfig("imageChannelId", channelId);
+                                }}
+                                fullWidth
+                            />
                         </Form.Item>
                         <Form.Item label="默认视频模型" className="mb-4">
-                            <ModelPicker config={modelConfig} value={modelConfig.videoModel} channelId={modelConfig.videoChannelId} onChange={(model, channelId) => { updateConfig("videoModel", model); if (channelId) updateConfig("videoChannelId", channelId); }} fullWidth />
+                            <ModelPicker
+                                config={modelConfig}
+                                value={modelConfig.videoModel}
+                                channelId={modelConfig.videoChannelId}
+                                onChange={(model, channelId) => {
+                                    updateConfig("videoModel", model);
+                                    if (channelId) updateConfig("videoChannelId", channelId);
+                                }}
+                                fullWidth
+                            />
                         </Form.Item>
                         <Form.Item label="默认文本模型" className="mb-4">
-                            <ModelPicker config={modelConfig} value={modelConfig.textModel} channelId={modelConfig.textChannelId} onChange={(model, channelId) => { updateConfig("textModel", model); if (channelId) updateConfig("textChannelId", channelId); }} fullWidth />
+                            <ModelPicker
+                                config={modelConfig}
+                                value={modelConfig.textModel}
+                                channelId={modelConfig.textChannelId}
+                                onChange={(model, channelId) => {
+                                    updateConfig("textModel", model);
+                                    if (channelId) updateConfig("textChannelId", channelId);
+                                }}
+                                fullWidth
+                            />
                         </Form.Item>
                     </div>
                     <div className="grid gap-4 md:grid-cols-3">

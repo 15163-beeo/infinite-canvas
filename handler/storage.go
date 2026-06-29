@@ -229,6 +229,42 @@ func UploadFile(w http.ResponseWriter, r *http.Request) {
 	OK(w, object)
 }
 
+func CreateImageLink(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxImageLinkBytes+1024*1024)
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		Fail(w, "请选择要生成链接的图片")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	contentType := header.Header.Get("Content-Type")
+	if strings.TrimSpace(contentType) == "" {
+		contentType = http.DetectContentType(data)
+	}
+	link, err := service.CreateImageLink(r.Context(), header.Filename, contentType, data)
+	if err != nil {
+		FailError(w, err)
+		return
+	}
+	OK(w, link)
+}
+
+func ImageLinkContent(w http.ResponseWriter, r *http.Request, id string) {
+	download, err := service.DownloadImageLink(id)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", download.Link.MimeType)
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	_, _ = w.Write(download.Data)
+}
+
 func DeleteFile(w http.ResponseWriter, r *http.Request, id string) {
 	var request struct {
 		Provider *service.StorageObjectProviderInput `json:"provider"`

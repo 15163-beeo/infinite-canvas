@@ -33,6 +33,19 @@ func DeleteStorageObjectRecord(id string) error {
 	return db.Delete(&model.StorageObject{}, "id = ?", id).Error
 }
 
+func ListStorageObjectsByProviderBefore(providerID string, cutoff string, limit int) ([]model.StorageObject, error) {
+	db, err := DB()
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	var objects []model.StorageObject
+	err = db.Where("provider_id = ? AND created_at <> '' AND created_at < ?", providerID, cutoff).Order("created_at ASC").Limit(limit).Find(&objects).Error
+	return objects, err
+}
+
 func GetUserConfig(userID string) (model.UserConfig, bool, error) {
 	db, err := DB()
 	if err != nil {

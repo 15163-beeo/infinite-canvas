@@ -86,7 +86,7 @@ export const defaultConfig: AiConfig = {
     models: [],
     publicChannels: [],
     quality: "auto",
-    size: "1:1",
+    size: "auto",
     outputFormat: "png",
     outputCompression: "100",
     moderation: "auto",

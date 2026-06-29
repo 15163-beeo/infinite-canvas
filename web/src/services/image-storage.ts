@@ -37,10 +37,40 @@ export const USER_STORAGE_PROVIDER_KEY = "infinite-canvas:user_storage_provider"
 let storageConfigPromise: Promise<{ mode: string; allowUserProvider: boolean }> | null = null;
 
 export async function uploadImage(input: string | Blob): Promise<UploadedImage> {
-    const blob = typeof input === "string" ? await (await fetch(input)).blob() : input;
+    const blob = typeof input === "string" ? await fetchImageBlob(input) : input;
     const serverUpload = await maybeUploadImageToServer(blob);
     if (serverUpload) return serverUpload;
     return storeImageBlobLocally(blob);
+}
+
+export async function canUploadImagesToServer() {
+    const config = await loadStorageConfig().catch(() => null);
+    if (!config) return false;
+    const token = useUserStore.getState().token;
+    if (!token) return false;
+    if (config.mode === "server_local" || config.mode === "server_sqlite_s3" || config.mode === "hybrid") return true;
+    return Boolean(config.allowUserProvider && loadUserStorageProvider());
+}
+
+async function fetchImageBlob(url: string) {
+    if (url.startsWith("data:")) return (await fetch(url)).blob();
+    try {
+        const response = await fetch(url);
+        if (response.ok) return response.blob();
+    } catch {
+        // Fall through to the server-side image fetcher for remote URLs that fail in the browser.
+    }
+    if (!/^https?:\/\//i.test(url)) throw new Error("图片读取失败");
+    const proxyResponse = await fetch("/api/remote-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+    });
+    if (!proxyResponse.ok) {
+        const payload = (await proxyResponse.json().catch(() => null)) as { msg?: string } | null;
+        throw new Error(payload?.msg || `远程图片读取失败：${proxyResponse.status}`);
+    }
+    return proxyResponse.blob();
 }
 
 export async function storeImageBlobLocally(blob: Blob): Promise<UploadedImage> {
@@ -77,11 +107,11 @@ export async function resolveImageUrl(storageKey?: string, fallback = "") {
 async function maybeUploadImageToServer(blob: Blob): Promise<UploadedImage | null> {
     const config = await loadStorageConfig().catch(() => null);
     const userProvider = config?.allowUserProvider ? loadUserStorageProvider() : null;
-    const useServerStorage = config && (config.mode === "server_sqlite_s3" || config.mode === "hybrid" || userProvider);
+    const useServerStorage = config && (config.mode === "server_local" || config.mode === "server_sqlite_s3" || config.mode === "hybrid" || userProvider);
     if (!config || !useServerStorage) return null;
     const token = useUserStore.getState().token;
     if (!token) {
-        if (config.mode === "server_sqlite_s3") throw new Error("服务端存储需要先登录");
+        if (config.mode === "server_local" || config.mode === "server_sqlite_s3") throw new Error("服务端存储需要先登录");
         return null;
     }
     const formData = new FormData();
@@ -161,7 +191,7 @@ export async function deleteStoredImages(keys: Iterable<string>) {
     );
 }
 
-export async function cleanupUnusedImages(usedData: unknown) {
+export async function cleanupUnusedImages(usedData: unknown, deleteCandidates?: unknown) {
     const usedKeys = collectImageStorageKeys(usedData);
     const historyKeys = await readStoredImageHistoryStorageKeys();
     historyKeys.forEach((key) => usedKeys.add(key));
@@ -169,6 +199,11 @@ export async function cleanupUnusedImages(usedData: unknown) {
     await store.iterate((_value, key) => {
         if (!usedKeys.has(key)) unused.push(key);
     });
+    if (deleteCandidates) {
+        collectImageStorageKeys(deleteCandidates).forEach((key) => {
+            if (!usedKeys.has(key)) unused.push(key);
+        });
+    }
     await deleteStoredImages(unused);
 }
 

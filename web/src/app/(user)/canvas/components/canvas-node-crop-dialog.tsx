@@ -5,13 +5,9 @@ import { Button, Modal } from "antd";
 import { Check, Lock, LockOpen, X } from "lucide-react";
 
 import { readImageMeta } from "@/lib/image-utils";
+import type { CanvasImageRect } from "../types";
 
-export type CanvasImageCropRect = {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-};
+export type CanvasImageCropRect = CanvasImageRect;
 
 type DragMode = "move" | "resize";
 type ResizeHandle = "n" | "e" | "s" | "w" | "ne" | "nw" | "se" | "sw";

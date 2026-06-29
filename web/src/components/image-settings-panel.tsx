@@ -6,11 +6,10 @@ import { ConfigProvider } from "antd";
 import { type CanvasTheme } from "@/lib/canvas-theme";
 import type { AiConfig } from "@/stores/use-config-store";
 
-const qualityOptions = [
-    { value: "auto", label: "自动" },
-    { value: "high", label: "高" },
-    { value: "medium", label: "中" },
-    { value: "low", label: "低" },
+const resolutionOptions = [
+    { value: "1k", label: "1K" },
+    { value: "2k", label: "2K" },
+    { value: "4k", label: "4K" },
 ];
 
 const formatOptions = [
@@ -28,20 +27,17 @@ const aspectOptions = [
     { value: "1:1", label: "1:1", width: 1024, height: 1024, icon: "square" },
     { value: "3:2", label: "3:2", width: 1536, height: 1024, icon: "landscape" },
     { value: "2:3", label: "2:3", width: 1024, height: 1536, icon: "portrait" },
-    { value: "4:3", label: "4:3", width: 1344, height: 1024, icon: "landscape" },
-    { value: "3:4", label: "3:4", width: 1024, height: 1344, icon: "portrait" },
-    { value: "9:16", label: "9:16", width: 1024, height: 1792, icon: "portrait" },
-    { value: "1:1-2k", label: "1:1(2k)", size: "2048x2048", width: 2048, height: 2048, icon: "square" },
-    { value: "16:9-2k", label: "16:9(2k)", size: "2048x1152", width: 2048, height: 1152, icon: "landscape" },
-    { value: "9:16-2k", label: "9:16(2k)", size: "1152x2048", width: 1152, height: 2048, icon: "portrait" },
-    { value: "16:9-4k", label: "16:9(4k)", size: "3840x2160", width: 3840, height: 2160, icon: "landscape" },
-    { value: "9:16-4k", label: "9:16(4k)", size: "2160x3840", width: 2160, height: 3840, icon: "portrait" },
+    { value: "16:9", label: "16:9", width: 1280, height: 720, icon: "landscape" },
+    { value: "9:16", label: "9:16", width: 720, height: 1280, icon: "portrait" },
+    { value: "4:3", label: "4:3", width: 1024, height: 768, icon: "landscape" },
+    { value: "3:4", label: "3:4", width: 768, height: 1024, icon: "portrait" },
+    { value: "21:9", label: "21:9", width: 1280, height: 544, icon: "landscape" },
     { value: "auto", label: "auto", width: 0, height: 0, icon: "auto" },
 ];
 
 type ImageSettingsPanelProps = {
     config: AiConfig;
-    onConfigChange: (key: "quality" | "size" | "count" | "outputFormat" | "outputCompression" | "moderation", value: string) => void;
+    onConfigChange: (key: "size" | "count" | "outputFormat" | "outputCompression" | "moderation", value: string) => void;
     theme: CanvasTheme;
     showTitle?: boolean;
     className?: string;
@@ -50,10 +46,10 @@ type ImageSettingsPanelProps = {
     collapsible?: boolean;
 };
 
-type ImageSettingSectionKey = "quality" | "size" | "aspect" | "count" | "format" | "compression" | "moderation";
+type ImageSettingSectionKey = "resolution" | "size" | "aspect" | "count" | "format" | "compression" | "moderation";
 
 const defaultCollapsedSettings: Record<ImageSettingSectionKey, boolean> = {
-    quality: false,
+    resolution: false,
     size: true,
     aspect: true,
     count: true,
@@ -64,21 +60,26 @@ const defaultCollapsedSettings: Record<ImageSettingSectionKey, boolean> = {
 
 export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = true, className = "w-[320px] space-y-4 rounded-2xl px-1 py-0.5", maxCount = 15, quickCount = 10, collapsible = false }: ImageSettingsPanelProps) {
     const [collapsedSettings, setCollapsedSettings] = useState(defaultCollapsedSettings);
-    const quality = config.quality || "auto";
     const count = Math.max(1, Math.min(maxCount, Math.floor(Math.abs(Number(config.count)) || 1)));
     const activeSize = config.size || "auto";
+    const activeResolution = imageResolutionValue(activeSize);
     const outputFormat = config.outputFormat || "png";
     const outputCompression = Math.max(0, Math.min(100, Math.floor(Number(config.outputCompression) || 100)));
     const moderation = config.moderation || "auto";
-    const selectedAspect = aspectOptions.find((item) => (item.size || item.value) === activeSize || item.value === activeSize);
+    const selectedAspectKey = activeSize === "auto" ? "auto" : readAspectKey(activeSize);
+    const selectedAspect = aspectOptions.find((item) => item.value === selectedAspectKey);
     const dimensions = readSizeDimensions(activeSize, selectedAspect || aspectOptions[0]);
     const selectAspect = (value: string) => {
         const option = aspectOptions.find((item) => item.value === value);
-        onConfigChange("size", option?.size || option?.value || "auto");
+        if (!option || option.value === "auto") {
+            onConfigChange("size", "auto");
+            return;
+        }
+        onConfigChange("size", resolveImageSizeForResolution(option.value, activeResolution));
     };
     const updateDimension = (key: "width" | "height", value: number | null) => {
         const next = Math.max(1, Math.floor(value || dimensions[key] || 1024));
-        onConfigChange("size", `${key === "width" ? next : dimensions.width}x${key === "height" ? next : dimensions.height}`);
+        onConfigChange("size", normalizeImageSize(`${key === "width" ? next : dimensions.width}x${key === "height" ? next : dimensions.height}`));
     };
     const renderSection = (key: ImageSettingSectionKey, title: string, summary: string, children: ReactNode) => {
         if (!collapsible) {
@@ -114,12 +115,12 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
             <div className={className} style={{ color: theme.node.text }} onMouseDown={(event) => event.stopPropagation()}>
                 {showTitle ? <div className="text-lg font-semibold">图像设置</div> : null}
                 {renderSection(
-                    "quality",
-                    "质量",
-                    imageQualityLabel(quality),
-                    <div className="grid grid-cols-4 gap-2.5">
-                        {qualityOptions.map((item) => (
-                            <OptionPill key={item.value} selected={quality === item.value} theme={theme} onClick={() => onConfigChange("quality", item.value)}>
+                    "resolution",
+                    "分辨率",
+                    imageResolutionLabel(activeSize),
+                    <div className="grid grid-cols-3 gap-2.5">
+                        {resolutionOptions.map((item) => (
+                            <OptionPill key={item.value} selected={activeResolution === item.value} theme={theme} onClick={() => onConfigChange("size", resolveImageSizeForResolution(activeSize, item.value))}>
                                 {item.label}
                             </OptionPill>
                         ))}
@@ -145,7 +146,7 @@ export function ImageSettingsPanel({ config, onConfigChange, theme, showTitle = 
                                 key={item.value}
                                 type="button"
                                 className="flex h-[72px] cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border bg-transparent text-sm transition hover:opacity-80"
-                                style={{ borderColor: selectedAspect?.value === item.value ? theme.node.text : theme.node.stroke, background: "transparent", color: theme.node.text }}
+                                style={{ borderColor: selectedAspectKey === item.value ? theme.node.text : theme.node.stroke, background: "transparent", color: theme.node.text }}
                                 onMouseDown={(event) => event.stopPropagation()}
                                 onClick={() => selectAspect(item.value)}
                             >
@@ -216,12 +217,65 @@ export function ImageSettingsTheme({ theme, children }: { theme: CanvasTheme; ch
     );
 }
 
-export function imageQualityLabel(value: string) {
-    return ({ auto: "自动", high: "高", medium: "中", low: "低" } as Record<string, string>)[value] || value;
+type ImageResolutionValue = "1k" | "2k" | "4k";
+type PresetRatio = "1:1" | "3:2" | "2:3" | "16:9" | "9:16" | "4:3" | "3:4" | "21:9";
+
+const commonResolutionSizes: Record<PresetRatio, Record<ImageResolutionValue, string>> = {
+    "1:1": { "1k": "1024x1024", "2k": "2048x2048", "4k": "2880x2880" },
+    "3:2": { "1k": "1536x1024", "2k": "2160x1440", "4k": "3456x2304" },
+    "2:3": { "1k": "1024x1536", "2k": "1440x2160", "4k": "2304x3456" },
+    "16:9": { "1k": "1280x720", "2k": "2560x1440", "4k": "3840x2160" },
+    "9:16": { "1k": "720x1280", "2k": "1440x2560", "4k": "2160x3840" },
+    "4:3": { "1k": "1024x768", "2k": "2048x1536", "4k": "3200x2400" },
+    "3:4": { "1k": "768x1024", "2k": "1536x2048", "4k": "2400x3200" },
+    "21:9": { "1k": "1280x544", "2k": "2560x1088", "4k": "3840x1600" },
+};
+
+const SIZE_MULTIPLE = 16;
+const MAX_EDGE = 3840;
+const MAX_ASPECT_RATIO = 3;
+const MIN_IMAGE_PIXELS = 655_360;
+const MAX_IMAGE_PIXELS = 8_294_400;
+const MAX_RATIO_ERROR = 0.01;
+
+const tierPixelBudget: Record<ImageResolutionValue, number> = {
+    "1k": 1_572_864,
+    "2k": 4_194_304,
+    "4k": MAX_IMAGE_PIXELS,
+};
+
+export function imageResolutionValue(size: string): ImageResolutionValue {
+    const dimensions = parseDimensions(size);
+    if (!dimensions) return "1k";
+    const longSide = Math.max(dimensions.width, dimensions.height);
+    const pixels = dimensions.width * dimensions.height;
+    if (pixels >= 6_000_000) return "4k";
+    if (longSide >= 3000) return "4k";
+    if (longSide >= 1800) return "2k";
+    return "1k";
+}
+
+export function imageResolutionLabel(size: string) {
+    return imageResolutionValue(size).toUpperCase();
+}
+
+export function imageAspectValue(size: string) {
+    if ((size || "").trim() === "auto") return "auto";
+    return readAspectKey(size) || "1:1";
+}
+
+export function resolveImageSizeForResolution(size: string, resolution: string) {
+    const normalized = normalizeResolution(resolution);
+    const aspectKey = readAspectKey(size);
+    const commonSize = aspectKey ? commonResolutionSizes[aspectKey]?.[normalized] : undefined;
+    if (commonSize) return commonSize;
+
+    const dimensions = parseDimensions(size) || { width: 1, height: 1 };
+    return calculateImageSize(normalized, `${dimensions.width}:${dimensions.height}`) || normalizeImageSize(`${dimensions.width}x${dimensions.height}`);
 }
 
 export function imageSizeLabel(size: string) {
-    return aspectOptions.find((item) => (item.size || item.value) === size || item.value === size)?.label || size;
+    return aspectOptions.find((item) => item.value === size)?.label || size;
 }
 
 export function imageFormatLabel(value: string) {
@@ -355,9 +409,133 @@ function SettingTitle({ children, color }: { children: string; color: string }) 
 }
 
 function readSizeDimensions(size: string, fallback: { width: number; height: number }) {
-    const match = size?.match(/^(\d+)x(\d+)$/);
+    const match = parseDimensions(size);
     return {
-        width: match ? Number(match[1]) : fallback.width,
-        height: match ? Number(match[2]) : fallback.height,
+        width: match ? match.width : fallback.width,
+        height: match ? match.height : fallback.height,
     };
+}
+
+function normalizeResolution(value: string): ImageResolutionValue {
+    return value === "2k" || value === "4k" ? value : "1k";
+}
+
+function parseDimensions(size: string) {
+    const match = size?.match(/^\s*(\d+)\s*[xX×]\s*(\d+)\s*$/);
+    if (!match) return null;
+    return { width: Number(match[1]), height: Number(match[2]) };
+}
+
+function parseRatio(value: string) {
+    const match = value.match(/^\s*(\d+(?:\.\d+)?)\s*[:xX×]\s*(\d+(?:\.\d+)?)\s*$/);
+    if (!match) return null;
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+    return { width, height };
+}
+
+function readAspectKey(size: string): PresetRatio | null {
+    const option = aspectOptions.find((item) => item.value === size);
+    if (option?.value && option.value !== "auto") return option.value as PresetRatio;
+
+    const dimensions = parseDimensions(size);
+    if (!dimensions) return null;
+    const ratio = dimensions.width / Math.max(1, dimensions.height);
+    return (
+        (Object.keys(commonResolutionSizes) as PresetRatio[]).find((key) => {
+            const [width, height] = key.split(":").map(Number);
+            return Math.abs(ratio - width / height) < 0.02;
+        }) || null
+    );
+}
+
+function getPresetRatioKey(ratioWidth: number, ratioHeight: number): PresetRatio | null {
+    if (!Number.isInteger(ratioWidth) || !Number.isInteger(ratioHeight)) return null;
+    const divisor = gcd(ratioWidth, ratioHeight);
+    const key = `${ratioWidth / divisor}:${ratioHeight / divisor}`;
+    return key in commonResolutionSizes ? (key as PresetRatio) : null;
+}
+
+function calculateImageSize(resolution: ImageResolutionValue, ratioValue: string) {
+    const parsed = parseRatio(ratioValue);
+    if (!parsed) return null;
+
+    const presetRatioKey = getPresetRatioKey(parsed.width, parsed.height);
+    if (presetRatioKey) return commonResolutionSizes[presetRatioKey][resolution];
+
+    const targetRatio = parsed.width / parsed.height;
+    const pixelBudget = tierPixelBudget[resolution];
+    let bestWidth = 0;
+    let bestHeight = 0;
+    let bestPixels = 0;
+
+    for (let width = SIZE_MULTIPLE; width <= MAX_EDGE; width += SIZE_MULTIPLE) {
+        const idealHeight = width / targetRatio;
+        const candidates = [Math.floor(idealHeight / SIZE_MULTIPLE) * SIZE_MULTIPLE, Math.ceil(idealHeight / SIZE_MULTIPLE) * SIZE_MULTIPLE];
+        for (const height of candidates) {
+            if (height < SIZE_MULTIPLE || height > MAX_EDGE) continue;
+            const pixels = width * height;
+            if (pixels > pixelBudget || pixels < MIN_IMAGE_PIXELS) continue;
+            if (Math.max(width / height, height / width) > MAX_ASPECT_RATIO) continue;
+            const ratioError = Math.abs(width / height - targetRatio) / targetRatio;
+            if (ratioError > MAX_RATIO_ERROR) continue;
+            if (pixels > bestPixels) {
+                bestPixels = pixels;
+                bestWidth = width;
+                bestHeight = height;
+            }
+        }
+    }
+
+    return bestPixels ? `${bestWidth}x${bestHeight}` : null;
+}
+
+function floorToMultiple(value: number, multiple: number) {
+    return Math.max(multiple, Math.floor(value / multiple) * multiple);
+}
+
+function roundToMultiple(value: number, multiple: number) {
+    return Math.max(multiple, Math.round(value / multiple) * multiple);
+}
+
+function ceilToMultiple(value: number, multiple: number) {
+    return Math.max(multiple, Math.ceil(value / multiple) * multiple);
+}
+
+function normalizeDimensions(width: number, height: number) {
+    let normalizedWidth = roundToMultiple(width, SIZE_MULTIPLE);
+    let normalizedHeight = roundToMultiple(height, SIZE_MULTIPLE);
+
+    const scaleToFit = (scale: number) => {
+        normalizedWidth = floorToMultiple(normalizedWidth * scale, SIZE_MULTIPLE);
+        normalizedHeight = floorToMultiple(normalizedHeight * scale, SIZE_MULTIPLE);
+    };
+    const scaleToFill = (scale: number) => {
+        normalizedWidth = ceilToMultiple(normalizedWidth * scale, SIZE_MULTIPLE);
+        normalizedHeight = ceilToMultiple(normalizedHeight * scale, SIZE_MULTIPLE);
+    };
+
+    for (let index = 0; index < 4; index += 1) {
+        const maxEdge = Math.max(normalizedWidth, normalizedHeight);
+        if (maxEdge > MAX_EDGE) scaleToFit(MAX_EDGE / maxEdge);
+        if (normalizedWidth / normalizedHeight > MAX_ASPECT_RATIO) normalizedWidth = floorToMultiple(normalizedHeight * MAX_ASPECT_RATIO, SIZE_MULTIPLE);
+        else if (normalizedHeight / normalizedWidth > MAX_ASPECT_RATIO) normalizedHeight = floorToMultiple(normalizedWidth * MAX_ASPECT_RATIO, SIZE_MULTIPLE);
+        const pixels = normalizedWidth * normalizedHeight;
+        if (pixels > MAX_IMAGE_PIXELS) scaleToFit(Math.sqrt(MAX_IMAGE_PIXELS / pixels));
+        else if (pixels < MIN_IMAGE_PIXELS) scaleToFill(Math.sqrt(MIN_IMAGE_PIXELS / pixels));
+    }
+
+    return { width: normalizedWidth, height: normalizedHeight };
+}
+
+function normalizeImageSize(size: string) {
+    const dimensions = parseDimensions(size);
+    if (!dimensions) return size.trim();
+    const normalized = normalizeDimensions(dimensions.width, dimensions.height);
+    return `${normalized.width}x${normalized.height}`;
+}
+
+function gcd(a: number, b: number): number {
+    return b === 0 ? a : gcd(b, a % b);
 }

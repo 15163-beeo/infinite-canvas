@@ -6,8 +6,14 @@ import copy from "copy-to-clipboard";
 export function useCopyText() {
     const { message } = App.useApp();
 
-    return (value: string, successText = "已复制") => {
-        copy(value);
-        message.success(successText);
+    return async (value: string, successText = "已复制") => {
+        try {
+            if (await copy(value)) {
+                message.success(successText);
+                return true;
+            }
+        } catch {}
+        message.error("复制失败，请手动复制");
+        return false;
     };
 }

@@ -10,21 +10,33 @@ import (
 )
 
 type Config struct {
-	Port                string `env:"PORT" envDefault:"18080"`
-	AdminUsername       string `env:"ADMIN_USERNAME" envDefault:"admin"`
-	AdminPassword       string `env:"ADMIN_PASSWORD" envDefault:"infinite-canvas"`
-	JWTSecret           string `env:"JWT_SECRET" envDefault:"infinite-canvas"`
-	JWTExpireHours      int    `env:"JWT_EXPIRE_HOURS" envDefault:"168"`
-	StorageDriver       string `env:"STORAGE_DRIVER" envDefault:"sqlite"`
-	DatabaseDSN         string `env:"DATABASE_DSN" envDefault:"data/infinite-canvas.db"`
-	AILogDir            string `env:"AI_LOG_DIR" envDefault:"data/logs/ai-calls"`
-	RemoveBGPython      string `env:"REMOVE_BG_PYTHON" envDefault:"python"`
-	RemoveBGPythonPath  string `env:"REMOVE_BG_PYTHONPATH" envDefault:".local/pydeps"`
-	RemoveBGModel       string `env:"REMOVE_BG_MODEL" envDefault:"u2netp"`
-	RemoveBGTimeout     int    `env:"REMOVE_BG_TIMEOUT_SECONDS" envDefault:"30"`
-	LinuxDoAuthorizeURL string `env:"LINUX_DO_AUTHORIZE_URL" envDefault:"https://connect.linux.do/oauth2/authorize"`
-	LinuxDoTokenURL     string `env:"LINUX_DO_TOKEN_URL" envDefault:"https://connect.linux.do/oauth2/token"`
-	LinuxDoUserInfoURL  string `env:"LINUX_DO_USERINFO_URL" envDefault:"https://connect.linux.do/api/user"`
+	Port                          string `env:"PORT" envDefault:"18080"`
+	AdminUsername                 string `env:"ADMIN_USERNAME" envDefault:"admin"`
+	AdminPassword                 string `env:"ADMIN_PASSWORD" envDefault:"infinite-canvas"`
+	JWTSecret                     string `env:"JWT_SECRET" envDefault:"infinite-canvas"`
+	JWTExpireHours                int    `env:"JWT_EXPIRE_HOURS" envDefault:"168"`
+	StorageDriver                 string `env:"STORAGE_DRIVER" envDefault:"sqlite"`
+	DatabaseDSN                   string `env:"DATABASE_DSN" envDefault:"data/infinite-canvas.db"`
+	FileStorageDir                string `env:"FILE_STORAGE_DIR"`
+	AILogDir                      string `env:"AI_LOG_DIR" envDefault:"data/logs/ai-calls"`
+	RemoveBGPython                string `env:"REMOVE_BG_PYTHON" envDefault:"python"`
+	RemoveBGPythonPath            string `env:"REMOVE_BG_PYTHONPATH" envDefault:".local/pydeps"`
+	RemoveBGModel                 string `env:"REMOVE_BG_MODEL" envDefault:"u2net"`
+	RemoveBGTimeout               int    `env:"REMOVE_BG_TIMEOUT_SECONDS" envDefault:"30"`
+	AliyunImageSegAccessKeyID     string `env:"ALIYUN_ACCESS_KEY_ID"`
+	AliyunImageSegAccessKeySecret string `env:"ALIYUN_ACCESS_KEY_SECRET"`
+	AliyunImageSegRegion          string `env:"ALIYUN_IMAGESEG_REGION" envDefault:"cn-shanghai"`
+	AliyunImageSegEndpoint        string `env:"ALIYUN_IMAGESEG_ENDPOINT" envDefault:"imageseg.cn-shanghai.aliyuncs.com"`
+	AliyunImageSegEnabled         bool   `env:"ALIYUN_IMAGESEG_ENABLED" envDefault:"true"`
+	AliyunImageSegTimeout         int    `env:"ALIYUN_IMAGESEG_TIMEOUT_SECONDS" envDefault:"20"`
+	AliyunOCREnabled              bool   `env:"ALIYUN_OCR_ENABLED" envDefault:"true"`
+	AliyunOCREndpoint             string `env:"ALIYUN_OCR_ENDPOINT" envDefault:"ocr-api.cn-hangzhou.aliyuncs.com"`
+	AliyunOCRType                 string `env:"ALIYUN_OCR_TYPE" envDefault:"Advanced"`
+	AliyunOCRTimeout              int    `env:"ALIYUN_OCR_TIMEOUT_SECONDS" envDefault:"20"`
+	AliyunOCRMinConfidence        int    `env:"ALIYUN_OCR_MIN_CONFIDENCE" envDefault:"55"`
+	LinuxDoAuthorizeURL           string `env:"LINUX_DO_AUTHORIZE_URL" envDefault:"https://connect.linux.do/oauth2/authorize"`
+	LinuxDoTokenURL               string `env:"LINUX_DO_TOKEN_URL" envDefault:"https://connect.linux.do/oauth2/token"`
+	LinuxDoUserInfoURL            string `env:"LINUX_DO_USERINFO_URL" envDefault:"https://connect.linux.do/api/user"`
 }
 
 var Cfg Config

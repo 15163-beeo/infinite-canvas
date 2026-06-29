@@ -6,6 +6,29 @@ from collections import deque
 from PIL import Image
 
 
+def solidify_foreground_alpha(
+    image: Image.Image,
+    alpha_threshold: int = 24,
+    source_image: Image.Image | None = None,
+) -> Image.Image:
+    """Make the kept subject opaque after local segmentation.
+
+    Local matting models can return a very soft alpha across the whole object.
+    That looks dirty on a dark canvas because the preview background bleeds
+    through the product. For product cutouts we keep transparency only for the
+    removed background and make the detected subject itself solid.
+    """
+    mask_source = image.convert("RGBA")
+    alpha = mask_source.getchannel("A")
+    if source_image is not None and source_image.size == mask_source.size:
+        output = source_image.convert("RGBA")
+    else:
+        output = mask_source.copy()
+    solid_alpha = alpha.point(lambda value: 255 if value >= alpha_threshold else 0, mode="L")
+    output.putalpha(solid_alpha)
+    return output
+
+
 def remove_edge_backdrop(image: Image.Image, alpha_threshold: int = 24) -> Image.Image:
     """Remove a flat color panel that rembg kept as part of the foreground.
 

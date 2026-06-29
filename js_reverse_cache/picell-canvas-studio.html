@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en" translate="no">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <!-- ★品牌升级弹窗：生产仅 picsetai.com 生效。登录/未登录用户都弹不可关弹窗，
+       点「开启 Picell AI」跳 picell.ai（登录的带 token 保持登录态，未登录的直接跳）。
+       其他域名/品牌/环境（.cn/picell/test/本地）完全不触发。
+
+       本地/测试预览（仅非 picsetai.com 域生效，生产用户碰不到）：
+         localStorage.setItem('__upgradePreview','1')   // 开启预览
+         localStorage.setItem('__upgradeTarget','http://localhost:8081')  // 可选：覆盖跳转目标
+         或在 URL 加 ?upgradePreview=1
+       关闭：localStorage.removeItem('__upgradePreview') -->
+    <script>
+      (function () {
+        try {
+          var host = location.hostname.replace(/^www\./, '');
+          var isProd = host === 'picsetai.com';
+          var preview =
+            !isProd &&
+            (location.search.indexOf('upgradePreview=1') >= 0 ||
+              localStorage.getItem('__upgradePreview') === '1');
+          if (!isProd && !preview) return; // 严格限定：非生产域且未开预览 → 不触发
+          // 跳转目标：生产固定 picell.ai；预览可用 __upgradeTarget 覆盖（指向本地/测试站）
+          window.__PICSET_UPGRADE_TARGET__ =
+            (preview && localStorage.getItem('__upgradeTarget')) || 'https://picell.ai';
+          // 登录/未登录都弹升级弹窗（不再即时跳转）
+          window.__PICSET_UPGRADE__ = true;
+        } catch (e) {}
+      })();
+    </script>
+
+    <!-- 禁用浏览器翻译功能，避免与 React DOM 冲突 -->
+    <meta name="google" content="notranslate" />
+    <meta http-equiv="Content-Language" content="en-US" />
+    <title>Picell - AI Visual Expert for E-commerce Brands</title>
+    <meta
+      name="description"
+      content="Create high-converting product images, detail page visuals, ads, and videos with Picell. An AI-powered visual design platform built for Amazon, Shopify, and modern e-commerce teams."
+    />
+    <meta
+      name="keywords"
+      content="Picell, AI product images, e-commerce visuals, detail page design, ad creative, e-commerce video, Amazon, Shopify, AI visual design platform."
+    />
+    <meta name="author" content="Picell" />
+    <meta name="robots" content="index, follow" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap"
+    />
+    <!-- todo to itself -->
+    <link rel="canonical" href="https://picell.ai/" />
+
+    <!-- Open Graph -->
+    <meta
+      property="og:title"
+      content="Picell - AI Visual Expert for E-commerce Brands"
+    />
+    <meta
+      property="og:description"
+      content="Create high-converting product images, detail page visuals, ads, and videos with Picell. An AI-powered visual design platform built for Amazon, Shopify, and modern e-commerce teams."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://picell.ai/" />
+    <meta property="og:image" content="https://picell.ai/logo.png" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:site_name" content="Picell" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta
+      name="twitter:title"
+      content="Picell - AI Visual Expert for E-commerce Brands"
+    />
+    <meta
+      name="twitter:description"
+      content="Create high-converting product images, detail page visuals, ads, and videos with Picell. An AI-powered visual design platform built for Amazon, Shopify, and modern e-commerce teams."
+    />
+    <meta name="twitter:image" content="https://picell.ai/logo.png" />
+
+    <!-- Google tag (gtag.js) — 仅在 VITE_GA_ID 非空时注入 -->
+    <script>
+      (function () {
+        var id = '';
+        if (!id || id === '%' + 'VITE_GA_ID' + '%') return;
+        var s = document.createElement('script');
+        s.async = true;
+        s.src = 'https://www.googletagmanager.com/gtag/js?id=' + id;
+        document.head.appendChild(s);
+        window.dataLayer = window.dataLayer || [];
+        function gtag() {
+          dataLayer.push(arguments);
+        }
+        window.gtag = gtag;
+        gtag('js', new Date());
+        gtag('config', id);
+      })();
+    </script>
+
+    <!-- JSON-LD：类型与 inLanguage 在运行时由 GlobalSEO 按当前语言更新 -->
+    <script id="software-application-json-ld" type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Picell",
+        "alternateName": "Picell",
+        "description": "Create high-converting product images, detail page visuals, ads, and videos. An AI-powered visual design platform built for Amazon, Shopify, and modern e-commerce teams.",
+        "url": "https://picell.ai/",
+        "inLanguage": "en-US",
+        "applicationCategory": "DesignApplication, BusinessApplication",
+        "operatingSystem": "Web, Windows, macOS, Android, iOS",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "screenshot": "https://picell.ai/screenshot.png",
+        "softwareVersion": "1.0.0",
+        "featureList": [
+          "AI Smart Product Suites",
+          "Visual DNA Style Replication",
+          "Multi-resolution High-fidelity Export",
+          "Intelligent Copywriting & USP Analysis"
+        ],
+        "author": {
+          "@type": "Organization",
+          "name": "Picell Team",
+          "url": "https://picell.ai/about"
+        }
+      }
+    </script>
+    <script type="module" crossorigin src="/assets/index-CYnt8vku.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Dy06M7hW.css">
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <!-- www → 裸域迁移：发送端（必须在 ES module 之前执行） -->
+    <script>
+      (function () {
+        if (location.hostname !== 'www.picell.ai') return;
+        var p = location.pathname,
+          s = location.search,
+          h = location.hash;
+        for (var i = 0; i < localStorage.length; i++) {
+          var key = localStorage.key(i);
+          if (key && key.indexOf('sb-') === 0 && key.indexOf('-auth-token') > 0) {
+            try {
+              var obj = JSON.parse(localStorage.getItem(key));
+              if (obj && obj.access_token && obj.refresh_token) {
+                var payload = encodeURIComponent(obj.access_token + '|' + obj.refresh_token);
+                location.replace('https://picell.ai' + p + s + '#_migrate=' + payload);
+                return;
+              }
+            } catch (e) {
+              /* ignore */
+            }
+          }
+        }
+        location.replace('https://picell.ai' + p + s + h);
+      })();
+    </script>
+  </body>
+</html>
+

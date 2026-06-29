@@ -75,8 +75,9 @@ type PublicStorageSetting struct {
 }
 
 type PublicAuthSetting struct {
-	AllowRegister *bool                    `json:"allowRegister"`
-	LinuxDo       PublicLinuxDoAuthSetting `json:"linuxDo"`
+	AllowRegister     *bool                    `json:"allowRegister"`
+	RequireInviteCode *bool                    `json:"requireInviteCode"`
+	LinuxDo           PublicLinuxDoAuthSetting `json:"linuxDo"`
 }
 
 type PublicLinuxDoAuthSetting struct {

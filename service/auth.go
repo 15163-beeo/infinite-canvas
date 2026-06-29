@@ -75,7 +75,8 @@ func Register(username string, password string, inviteCode string) (model.AuthSe
 		return model.AuthSession{}, safeMessageError{message: "用户名和密码不能为空"}
 	}
 	inviteCode = strings.ToUpper(strings.TrimSpace(inviteCode))
-	if inviteCode == "" {
+	requireInviteCode := normalizedSettings.Public.Auth.RequireInviteCode != nil && *normalizedSettings.Public.Auth.RequireInviteCode
+	if requireInviteCode && inviteCode == "" {
 		return model.AuthSession{}, safeMessageError{message: "请输入邀请码"}
 	}
 	if _, ok, err := repository.GetUserByUsername(username); err != nil || ok {
@@ -84,18 +85,22 @@ func Register(username string, password string, inviteCode string) (model.AuthSe
 		}
 		return model.AuthSession{}, safeMessageError{message: "用户名已存在"}
 	}
-	invite, ok, err := repository.GetInviteCodeByCode(inviteCode)
-	if err != nil {
-		return model.AuthSession{}, err
-	}
-	if !ok {
-		return model.AuthSession{}, safeMessageError{message: "邀请码不存在"}
-	}
-	if invite.Status == model.InviteCodeStatusUsed {
-		return model.AuthSession{}, safeMessageError{message: "邀请码已被使用"}
-	}
-	if invite.Status == model.InviteCodeStatusDisabled {
-		return model.AuthSession{}, safeMessageError{message: "邀请码已停用"}
+	var invite *model.InviteCode
+	if inviteCode != "" {
+		item, ok, err := repository.GetInviteCodeByCode(inviteCode)
+		if err != nil {
+			return model.AuthSession{}, err
+		}
+		if !ok {
+			return model.AuthSession{}, safeMessageError{message: "邀请码不存在"}
+		}
+		if item.Status == model.InviteCodeStatusUsed {
+			return model.AuthSession{}, safeMessageError{message: "邀请码已被使用"}
+		}
+		if item.Status == model.InviteCodeStatusDisabled {
+			return model.AuthSession{}, safeMessageError{message: "邀请码已停用"}
+		}
+		invite = &item
 	}
 	hash, err := hashPassword(password)
 	if err != nil {
@@ -107,12 +112,16 @@ func Register(username string, password string, inviteCode string) (model.AuthSe
 		Password:  hash,
 		Role:      model.UserRoleUser,
 		AffCode:   newAffCode(),
-		InviterID: invite.CreatedBy,
 		Status:    model.UserStatusActive,
 		CreatedAt: now(),
 		UpdatedAt: now(),
 	}
-	user, err = repository.CreateUserWithInviteCode(user, invite)
+	if invite != nil {
+		user.InviterID = invite.CreatedBy
+		user, err = repository.CreateUserWithInviteCode(user, *invite)
+	} else {
+		user, err = repository.SaveUser(user)
+	}
 	if err != nil {
 		if err.Error() == "邀请码不存在" || err.Error() == "邀请码不可用" {
 			return model.AuthSession{}, safeMessageError{message: "邀请码不可用"}

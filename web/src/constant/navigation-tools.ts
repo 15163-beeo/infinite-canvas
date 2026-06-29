@@ -1,4 +1,4 @@
-import { FileText, ImagePlus, Images, Maximize2, Video } from "lucide-react";
+import { FileText, ImagePlus, Images, Maximize2, Video, WandSparkles } from "lucide-react";
 import { promptLibraryEnabled } from "./feature-flags";
 
 const allNavigationTools = [
@@ -11,6 +11,11 @@ const allNavigationTools = [
         slug: "image",
         label: "生图工作台",
         icon: ImagePlus,
+    },
+    {
+        slug: "aesthetic-mirror",
+        label: "爆款复刻",
+        icon: WandSparkles,
     },
     {
         slug: "video",

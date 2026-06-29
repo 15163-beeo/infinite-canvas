@@ -38,10 +38,10 @@ const emptySettings: AdminSettings = {
             systemPrompts: { image: "", video: "", text: "", workflow: "", workflowAgent: "" },
             allowCustomChannel: true,
         },
-        auth: { allowRegister: true, linuxDo: { enabled: false } },
-        storage: { mode: "local_indexeddb", allowUserProvider: false },
+        auth: { allowRegister: true, requireInviteCode: false, linuxDo: { enabled: false } },
+        storage: { mode: "server_local", allowUserProvider: false },
     },
-    private: { channels: [], promptSync: { enabled: true, cron: "*/5 * * * *" }, aiLog: { localDirectReportEnabled: false, cleanup: { enabled: false, retentionDays: 14, cron: "0 3 * * *" } }, auth: { linuxDo: { clientId: "", clientSecret: "" } }, storage: { mode: "local_indexeddb", allowUserProvider: false, providers: [], roundRobinCursor: 0, capacityCheck: { enabled: false, cron: "0 */6 * * *" }, capacityLimitBytes: 9 * 1024 * 1024 * 1024 } },
+    private: { channels: [], promptSync: { enabled: true, cron: "*/5 * * * *" }, aiLog: { localDirectReportEnabled: false, cleanup: { enabled: false, retentionDays: 14, cron: "0 3 * * *" } }, auth: { linuxDo: { clientId: "", clientSecret: "" } }, storage: { mode: "server_local", allowUserProvider: false, providers: [], roundRobinCursor: 0, capacityCheck: { enabled: false, cron: "0 */6 * * *" }, capacityLimitBytes: 9 * 1024 * 1024 * 1024 } },
 };
 const emptyChannel: AdminModelChannel = { id: "", protocol: "openai", name: "", baseUrl: "", apiKey: "", models: [], weight: 1, timeout: 600, enabled: true, remark: "" };
 const emptyStorageProvider: AdminStorageProvider = { id: "", name: "", type: "s3", endpoint: "", region: "auto", bucket: "", accessKeyId: "", secretAccessKey: "", publicBaseUrl: "", pathPrefix: "images", weight: 1, enabled: true, ownerUserId: "", capacityBytes: 0, capacityCheckedAt: "", capacityExceeded: false };
@@ -500,6 +500,11 @@ export default function AdminSettingsPage() {
                                         </Form.Item>
                                     </Col>
                                     <Col span={24}>
+                                        <Form.Item name={["public", "auth", "requireInviteCode"]} label="注册是否必须填写邀请码" extra="关闭后用户可直接注册；开启后注册表单和注册接口都会要求邀请码" valuePropName="checked">
+                                            <Switch />
+                                        </Form.Item>
+                                    </Col>
+                                    <Col span={24}>
                                         <Typography.Title level={5}>模型算力点</Typography.Title>
                                         <Table
                                             rowKey="model"
@@ -618,9 +623,10 @@ export default function AdminSettingsPage() {
                                 <Card size="small" title="数据存储">
                                     <Row gutter={16}>
                                         <Col xs={24} md={8}>
-                                            <Form.Item name={["private", "storage", "mode"]} label="存储模式" extra="local_indexeddb 保持浏览器本地；server_sqlite_s3 使用后端 SQLite + S3/R2。">
+                                            <Form.Item name={["private", "storage", "mode"]} label="存储模式" extra="server_local 保存到服务器本地文件；local_indexeddb 保持浏览器本地；server_sqlite_s3 使用后端 SQLite + S3/R2。">
                                                 <Select
                                                     options={[
+                                                        { value: "server_local", label: "服务器本地文件" },
                                                         { value: "local_indexeddb", label: "IndexedDB 本地" },
                                                         { value: "server_sqlite_s3", label: "SQLite + S3/R2" },
                                                         { value: "hybrid", label: "混合模式" },
@@ -1050,12 +1056,13 @@ function normalizePublicSetting(setting: Partial<AdminSettings["public"]> = {}):
         },
         auth: {
             allowRegister: setting.auth?.allowRegister !== false,
+            requireInviteCode: setting.auth?.requireInviteCode === true,
             linuxDo: {
                 enabled: setting.auth?.linuxDo?.enabled === true,
             },
         },
         storage: {
-            mode: setting.storage?.mode || "local_indexeddb",
+            mode: setting.storage?.mode || "server_local",
             allowUserProvider: setting.storage?.allowUserProvider === true,
         },
     };
@@ -1087,7 +1094,7 @@ function normalizePrivateSetting(setting: Partial<AdminSettings["private"]> = {}
             },
         },
         storage: {
-            mode: setting.storage?.mode || "local_indexeddb",
+            mode: setting.storage?.mode || "server_local",
             allowUserProvider: setting.storage?.allowUserProvider === true,
             providers: (setting.storage?.providers || []).map(normalizeStorageProvider),
             roundRobinCursor: Number(setting.storage?.roundRobinCursor) || 0,

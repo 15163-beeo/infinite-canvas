@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Modal, Segmented, Tooltip } from "antd";
-import { Camera, Download, Eraser, FileArchive, FolderPlus, Image as ImageIcon, Info, Layers3, Lock, LockOpen, Maximize2, MessageSquare, Minus, Pencil, Plus, RefreshCw, Scissors, Settings2, Trash2, Upload, Video } from "lucide-react";
+import { Download, Eraser, FileArchive, FolderPlus, Image as ImageIcon, Layers3, Minus, Pencil, Plus, RefreshCw, Scissors, Type, Video, WandSparkles } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
 import { formatBytes, getDataUrlByteSize } from "@/lib/image-utils";
@@ -18,7 +18,6 @@ type CanvasNodeHoverToolbarProps = {
     onEditText: (node: CanvasNodeData) => void;
     onDecreaseFont: (node: CanvasNodeData) => void;
     onIncreaseFont: (node: CanvasNodeData) => void;
-    onToggleDialog: (node: CanvasNodeData) => void;
     onGenerateImage: (node: CanvasNodeData) => void;
     onUpload: (node: CanvasNodeData) => void;
     onDownload: (node: CanvasNodeData) => void;
@@ -26,13 +25,11 @@ type CanvasNodeHoverToolbarProps = {
     onExportPsd: (node: CanvasNodeData) => void;
     onSaveAsset: (node: CanvasNodeData) => void;
     onCrop: (node: CanvasNodeData) => void;
-    onAngle: (node: CanvasNodeData) => void;
+    onLocalEdit: (node: CanvasNodeData) => void;
+    onEditImageText: (node: CanvasNodeData) => void;
     onLayerImage: (node: CanvasNodeData) => void;
     onRemoveBackground: (node: CanvasNodeData) => void;
-    onViewImage: (node: CanvasNodeData) => void;
     onRetry: (node: CanvasNodeData) => void;
-    onToggleFreeResize: (node: CanvasNodeData) => void;
-    onDelete: (node: CanvasNodeData) => void;
 };
 
 export function CanvasNodeHoverToolbar({
@@ -44,7 +41,6 @@ export function CanvasNodeHoverToolbar({
     onEditText,
     onDecreaseFont,
     onIncreaseFont,
-    onToggleDialog,
     onGenerateImage,
     onUpload,
     onDownload,
@@ -52,15 +48,14 @@ export function CanvasNodeHoverToolbar({
     onExportPsd,
     onSaveAsset,
     onCrop,
-    onAngle,
+    onLocalEdit,
+    onEditImageText,
     onLayerImage,
     onRemoveBackground,
-    onViewImage,
     onRetry,
-    onToggleFreeResize,
-    onDelete,
 }: CanvasNodeHoverToolbarProps) {
     if (!node) return null;
+    if (node.type === CanvasNodeType.Config) return null;
 
     const left = viewport.x + (node.position.x + node.width / 2) * viewport.k;
     const top = viewport.y + node.position.y * viewport.k - 14;
@@ -70,13 +65,14 @@ export function CanvasNodeHoverToolbar({
     const hasVideo = isVideo && Boolean(node.metadata?.content);
     const isText = node.type === CanvasNodeType.Text;
     const isLayerText = isText && Boolean(node.metadata?.layerText);
-    const isConfig = node.type === CanvasNodeType.Config;
-    const canOpenDialog = (isText && !isLayerText) || hasImage || isVideo;
     const canRetry = node.metadata?.status === "error";
-    const hasSpecificTools = canRetry || isText || isImage || isVideo || isConfig;
+    const hasToolbarActions = canRetry || hasImage || hasVideo || isText || isVideo || canExportPsd;
+
+    if (!hasToolbarActions) return null;
 
     return (
         <div
+            data-canvas-no-zoom
             className="absolute z-[70] flex h-12 -translate-x-1/2 -translate-y-full items-center overflow-visible rounded-[18px] border border-black/10 bg-white text-[15px] text-[#242529] shadow-[0_8px_28px_rgba(15,23,42,.12)]"
             style={{ left, top }}
             onMouseEnter={() => onKeep(node.id)}
@@ -84,35 +80,20 @@ export function CanvasNodeHoverToolbar({
             onMouseDown={(event) => event.stopPropagation()}
             onPointerDown={(event) => event.stopPropagation()}
         >
-            <ToolbarAction title="查看节点信息" label="信息" icon={<Info className="size-4" />} onClick={() => onInfo(node)} />
-            <ToolbarAction title="移除节点" label="删除" icon={<Trash2 className="size-4" />} onClick={() => onDelete(node)} danger />
-            {hasSpecificTools ? <ToolbarDivider /> : null}
             {canRetry ? <ToolbarAction title="重新生成" label="重试" icon={<RefreshCw className="size-4" />} onClick={() => onRetry(node)} /> : null}
             {hasImage || hasVideo || isText ? <ToolbarAction title="加入我的素材" label="存素材" icon={<FolderPlus className="size-4" />} onClick={() => onSaveAsset(node)} /> : null}
             {hasImage || hasVideo ? <IconAction title={hasVideo ? "下载视频" : "下载图片"} icon={<Download className="size-5" />} onClick={() => onDownload(node)} /> : null}
             {canExportPsd ? <ToolbarAction title="导出当前智能分层组 PSD" label="导出整组PSD" icon={<FileArchive className="size-4" />} onClick={() => onExportPsd(node)} /> : null}
-            {canOpenDialog ? <ToolbarAction title="编辑" label="编辑" icon={<MessageSquare className="size-4" />} onClick={() => onToggleDialog(node)} /> : null}
             {isText ? <ToolbarAction title="编辑文本" label="编辑文字" icon={<Pencil className="size-4" />} onClick={() => onEditText(node)} /> : null}
             {isText && !isLayerText ? <ToolbarAction title="用文本生图" label="生图" icon={<ImageIcon className="size-4" />} onClick={() => onGenerateImage(node)} /> : null}
-            {isConfig ? <ToolbarAction title="生成配置" label="生成配置" icon={<Settings2 className="size-4" />} onClick={() => onInfo(node)} /> : null}
             {isText ? <ToolbarAction title="减小字号" label="缩小" icon={<Minus className="size-4" />} onClick={() => onDecreaseFont(node)} /> : null}
             {isText ? <ToolbarAction title="增大字号" label="放大" icon={<Plus className="size-4" />} onClick={() => onIncreaseFont(node)} /> : null}
-            {isImage ? <ToolbarAction title={hasImage ? "替换图片" : "上传图片"} label={hasImage ? "替换图片" : "上传图片"} icon={<Upload className="size-4" />} onClick={() => onUpload(node)} /> : null}
             {isVideo ? <ToolbarAction title={hasVideo ? "替换视频" : "上传视频"} label={hasVideo ? "替换视频" : "上传视频"} icon={<Video className="size-4" />} onClick={() => onUpload(node)} /> : null}
-            {hasImage ? (
-                <ToolbarAction
-                    title={node.metadata?.freeResize ? "切换为等比缩放" : "切换为自由比例"}
-                    label={node.metadata?.freeResize ? "自由比例" : "锁比例"}
-                    icon={node.metadata?.freeResize ? <LockOpen className="size-4" /> : <Lock className="size-4" />}
-                    onClick={() => onToggleFreeResize(node)}
-                    active={node.metadata?.freeResize}
-                />
-            ) : null}
             {hasImage ? <ToolbarAction title="裁剪并生成新节点" label="裁剪" icon={<Scissors className="size-4" />} onClick={() => onCrop(node)} /> : null}
-            {hasImage ? <ToolbarAction title="生成角度" label="多角度" icon={<Camera className="size-4" />} onClick={() => onAngle(node)} /> : null}
+            {hasImage ? <ToolbarAction title="识别并替换图片里的文字" label="编辑文字" icon={<Type className="size-4" />} onClick={() => onEditImageText(node)} /> : null}
+            {hasImage ? <ToolbarAction title="框选一个矩形区域并重新生成该区域" label="局部编辑" icon={<WandSparkles className="size-4" />} onClick={() => onLocalEdit(node)} /> : null}
             {hasImage ? <ToolbarAction title="拆分背景层和主体层" label="智能分层" icon={<Layers3 className="size-4" />} onClick={() => onLayerImage(node)} /> : null}
             {hasImage ? <ToolbarAction title="去除背景并生成新节点" label="去背景" icon={<Eraser className="size-4" />} onClick={() => onRemoveBackground(node)} /> : null}
-            {hasImage ? <ToolbarAction title="查看图片详情" label="查看大图" icon={<Maximize2 className="size-4" />} onClick={() => onViewImage(node)} /> : null}
         </div>
     );
 }
@@ -209,10 +190,6 @@ function IconAction({ title, icon, onClick }: { title: string; icon: ReactNode; 
             </button>
         </Tooltip>
     );
-}
-
-function ToolbarDivider() {
-    return <span className="mx-1 h-7 w-px scale-x-50 bg-[#dedee2]" />;
 }
 
 function InfoRow({ label, value }: { label: string; value: ReactNode }) {

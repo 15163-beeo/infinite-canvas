@@ -24,7 +24,7 @@ func LayerImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contentType := strings.TrimSpace(header.Header.Get("Content-Type"))
-	if contentType == "" {
+	if contentType == "" || !strings.HasPrefix(strings.ToLower(contentType), "image/") {
 		contentType = http.DetectContentType(data)
 	}
 
@@ -36,6 +36,8 @@ func LayerImage(w http.ResponseWriter, r *http.Request) {
 		TextChannelID: r.FormValue("textChannelId"),
 		BaseURL:       r.FormValue("baseUrl"),
 		APIKey:        r.FormValue("apiKey"),
+		TextBaseURL:   r.FormValue("textBaseUrl"),
+		TextAPIKey:    r.FormValue("textApiKey"),
 	})
 	if err != nil {
 		FailError(w, err)

@@ -3,6 +3,13 @@ export type Position = {
     y: number;
 };
 
+export type CanvasImageRect = {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+};
+
 export type ViewportTransform = {
     x: number;
     y: number;
@@ -32,12 +39,16 @@ export type CanvasNodeMetadata = {
     fontFamily?: string;
     fontWeight?: string;
     fontStyle?: string;
+    textStrokeColor?: string;
+    textStrokeWidth?: number;
     textOpacity?: number;
     rotation?: number;
     layerText?: boolean;
     layerGroupId?: string;
+    boundGroupId?: string;
     layerSourceId?: string;
     layerRole?: "background" | "product" | "text";
+    mergedLayer?: boolean;
     generationMode?: CanvasGenerationMode;
     generationType?: CanvasImageGenerationType;
     model?: string;
@@ -57,11 +68,18 @@ export type CanvasNodeMetadata = {
     naturalHeight?: number;
     freeResize?: boolean;
     removeBackground?: boolean;
+    hidePromptPanel?: boolean;
     removeBackgroundVersion?: number;
     removeBackgroundSourceWidth?: number;
     removeBackgroundSourceHeight?: number;
     removeBackgroundSourceNaturalWidth?: number;
     removeBackgroundSourceNaturalHeight?: number;
+    removeBackgroundOriginalWidth?: number;
+    removeBackgroundOriginalHeight?: number;
+    removeBackgroundProductOffsetX?: number;
+    removeBackgroundProductOffsetY?: number;
+    removeBackgroundProductWidth?: number;
+    removeBackgroundProductHeight?: number;
     isBatchRoot?: boolean;
     batchRootId?: string;
     batchChildIds?: string[];
@@ -72,6 +90,9 @@ export type CanvasNodeMetadata = {
     storageKey?: string;
     mimeType?: string;
     bytes?: number;
+    skipInitialStorageUpload?: boolean;
+    editSourceNodeId?: string;
+    editMaskRect?: CanvasImageRect;
 };
 
 export type CanvasNodeData = {
