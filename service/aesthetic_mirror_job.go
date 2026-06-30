@@ -6,6 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"mime/multipart"
@@ -231,6 +234,9 @@ func executeAestheticMirrorJob(user model.AuthUser, token string, input Aestheti
 			imageDataURL, err = submitAestheticMirrorAPIMartGeneration(requestCtx, user, token, input, resolvedPrompt)
 		} else {
 			imageDataURL, err = submitAestheticMirrorEdit(requestCtx, user, token, input, resolvedPrompt)
+		}
+		if err == nil {
+			err = validateAestheticMirrorResultSize(imageDataURL, input.Size)
 		}
 		if err == nil {
 			return imageDataURL, nil
@@ -585,10 +591,13 @@ func shouldRetryAestheticMirrorError(channel model.ModelChannel, err error, atte
 	if attempt >= aestheticMirrorRetryAttempts || err == nil {
 		return false
 	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(message, "尺寸不匹配") || strings.Contains(message, "size mismatch") {
+		return true
+	}
 	if !isAestheticMirrorAPIMartChannel(channel) {
 		return false
 	}
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
 	return strings.Contains(message, "please wait and try again later") ||
 		strings.Contains(message, "thank you for your patience") ||
 		strings.Contains(message, "429") ||
@@ -811,6 +820,33 @@ func parseAestheticMirrorPixelSize(size string) (int, int, bool) {
 		return 0, 0, false
 	}
 	return width, height, width > 0 && height > 0
+}
+
+func validateAestheticMirrorResultSize(imageDataURL string, requestedSize string) error {
+	expectedWidth, expectedHeight, ok := parseAestheticMirrorPixelSize(requestedSize)
+	if !ok || strings.TrimSpace(imageDataURL) == "" {
+		return nil
+	}
+	actualWidth, actualHeight, ok := parseAestheticMirrorImageDataURLSize(imageDataURL)
+	if !ok {
+		return nil
+	}
+	if actualWidth == expectedWidth && actualHeight == expectedHeight {
+		return nil
+	}
+	return safeMessageError{message: fmt.Sprintf("生成图片尺寸不匹配，期望 %dx%d，实际 %dx%d，正在重试", expectedWidth, expectedHeight, actualWidth, actualHeight)}
+}
+
+func parseAestheticMirrorImageDataURLSize(value string) (int, int, bool) {
+	data, _, err := decodeAestheticMirrorDataURL(value)
+	if err != nil {
+		return 0, 0, false
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0, false
+	}
+	return config.Width, config.Height, config.Width > 0 && config.Height > 0
 }
 
 func aestheticMirrorLocalAPIURL(path string) string {

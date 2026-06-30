@@ -1,6 +1,11 @@
 package service
 
 import (
+	"bytes"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/png"
 	"strings"
 	"testing"
 )
@@ -45,4 +50,25 @@ func TestBuildAestheticMirrorTaskPromptPrefersExplicitRule(t *testing.T) {
 	if strings.Contains(prompt, "产品主视觉海报") {
 		t.Fatalf("explicit rule should override analysis layout: %s", prompt)
 	}
+}
+
+func TestValidateAestheticMirrorResultSize(t *testing.T) {
+	dataURL := testAestheticMirrorPNGDataURL(t, 12, 16)
+	if err := validateAestheticMirrorResultSize(dataURL, "12x16"); err != nil {
+		t.Fatalf("expected matching size to pass: %v", err)
+	}
+	if err := validateAestheticMirrorResultSize(dataURL, "16x16"); err == nil || !strings.Contains(err.Error(), "尺寸不匹配") {
+		t.Fatalf("expected size mismatch error, got %v", err)
+	}
+}
+
+func testAestheticMirrorPNGDataURL(t *testing.T, width int, height int) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	img.Set(0, 0, color.RGBA{R: 255, A: 255})
+	var buffer bytes.Buffer
+	if err := png.Encode(&buffer, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buffer.Bytes())
 }
