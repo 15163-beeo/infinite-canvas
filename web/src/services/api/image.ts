@@ -129,9 +129,10 @@ const MIME_MAP: Record<ImageRequestParams["outputFormat"], string> = {
     webp: "image/webp",
 };
 const PROMPT_REWRITE_GUARD_PREFIX = "Use the following text as the complete prompt. Do not rewrite it:";
-const EDIT_RESPONSES_FALLBACK_DISABLED_MODELS = new Set(["gpt-image-2"]);
 const APIMART_GPT_IMAGE_2_MODEL = "gpt-image-2";
 const APIMART_GPT_IMAGE_2_OFFICIAL_MODEL = "gpt-image-2-official";
+const APIMART_GPT_IMAGE_2_MODEL_ALIASES = new Set([APIMART_GPT_IMAGE_2_MODEL, APIMART_GPT_IMAGE_2_OFFICIAL_MODEL, "novadream-img-2"]);
+const EDIT_RESPONSES_FALLBACK_DISABLED_MODELS = new Set(APIMART_GPT_IMAGE_2_MODEL_ALIASES);
 const APIMART_TASK_POLL_INTERVAL_MS = 3000;
 const APIMART_GPT_IMAGE_2_MAX_WAIT_SECONDS = 240;
 const OCR_REQUEST_IMAGE_LIMIT = 8;
@@ -324,9 +325,14 @@ function gcd(a: number, b: number): number {
     return b === 0 ? a : gcd(b, a % b);
 }
 
+function isApimartGptImage2FamilyModel(value: string | undefined) {
+    return APIMART_GPT_IMAGE_2_MODEL_ALIASES.has(normalizeModelName(value));
+}
+
 function isApimartGptImage2Model(config: AiConfig) {
-    if (normalizeModelName(config.model || config.imageModel) !== APIMART_GPT_IMAGE_2_MODEL) return false;
-    return activeImageChannelBaseUrl(config).toLowerCase().includes("apimart.ai");
+    if (!isApimartGptImage2FamilyModel(config.model || config.imageModel)) return false;
+    const baseUrl = activeImageChannelBaseUrl(config).toLowerCase();
+    return baseUrl.includes("apimart.ai") || baseUrl.includes("apimart");
 }
 
 function activeImageChannelBaseUrl(config: AiConfig) {
@@ -395,7 +401,8 @@ function collectApimartTaskImageUrls(payload: ApimartImageTaskStatusResponse) {
 function apimartTaskStatusUrl(config: AiConfig, taskId: string) {
     const url = aiApiUrl(config, `/tasks/${encodeURIComponent(taskId)}`);
     if (config.channelMode !== "remote") return url;
-    return `${url}?model=${encodeURIComponent(config.model || APIMART_GPT_IMAGE_2_MODEL)}`;
+    const taskModel = isApimartGptImage2Model(config) ? APIMART_GPT_IMAGE_2_MODEL : config.model || APIMART_GPT_IMAGE_2_MODEL;
+    return `${url}?model=${encodeURIComponent(taskModel)}`;
 }
 
 async function delay(ms: number) {

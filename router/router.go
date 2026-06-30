@@ -35,6 +35,7 @@ func New() *gin.Engine {
 	v1 := api.Group("/v1", middleware.UserAuth)
 	v1.POST("/images/generations", gin.WrapF(handler.AIImagesGenerations))
 	v1.POST("/images/edits", gin.WrapF(handler.AIImagesEdits))
+	v1.POST("/aesthetic-mirror/jobs", gin.WrapF(handler.CreateAestheticMirrorJob))
 	v1.POST("/uploads/images", gin.WrapF(handler.AIUploadImage))
 	v1.POST("/images/layer-image", gin.WrapF(handler.LayerImage))
 	v1.POST("/images/remove-background", gin.WrapF(handler.RemoveBackground))
@@ -71,6 +72,9 @@ func New() *gin.Engine {
 	})
 	v1.GET("/tasks/:id", func(c *gin.Context) {
 		handler.AITask(c.Writer, c.Request, c.Param("id"))
+	})
+	v1.GET("/aesthetic-mirror/jobs/:id", func(c *gin.Context) {
+		handler.AestheticMirrorJob(c.Writer, c.Request, c.Param("id"))
 	})
 	api.GET("/prompts", middleware.OptionalAuth, gin.WrapF(handler.Prompts))
 	api.GET("/assets", middleware.OptionalAuth, gin.WrapF(handler.Assets))

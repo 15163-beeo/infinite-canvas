@@ -1,7 +1,7 @@
 "use client";
 
 import { App, Button, Drawer, Empty, Image, Input, Modal, Select, Tag, Tooltip } from "antd";
-import { Copy, Download, Eye, Gauge, History, ImagePlus, LoaderCircle, Pencil, RefreshCw, Settings2, Sparkles, Trash2, UploadCloud, WandSparkles, X } from "lucide-react";
+import { Download, Eye, Gauge, History, ImagePlus, LoaderCircle, Pencil, RefreshCw, Settings2, Sparkles, Trash2, UploadCloud, WandSparkles, X } from "lucide-react";
 import localforage from "localforage";
 import { nanoid } from "nanoid";
 import { useRouter } from "next/navigation";
@@ -13,22 +13,29 @@ import { fitNodeSize } from "../canvas/utils/canvas-node-size";
 import { ModelPicker } from "@/components/model-picker";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { cn } from "@/lib/utils";
+import { createAestheticMirrorJob, fetchAestheticMirrorJob, type AestheticMirrorJobImagePayload } from "@/services/api/aesthetic-mirror";
 import { requestEdit } from "@/services/api/image";
 import { deleteStoredImages, imageToDataUrl, uploadImage } from "@/services/image-storage";
-import { useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
+import { useUserStore } from "@/stores/use-user-store";
 import type { ReferenceImage } from "@/types/image";
 
 type UploadRole = "reference" | "product";
 type MirrorStatus = "idle" | "running" | "success" | "failed";
+type MirrorMode = "single" | "batch";
 
 type MirrorResult = {
     id: string;
     status: MirrorStatus;
     prompt: string;
+    jobId?: string;
     referenceId?: string;
     referenceName?: string;
     referenceIndex?: number;
+    groupIndex?: number;
     dataUrl?: string;
+    width?: number;
+    height?: number;
     error?: string;
 };
 
@@ -40,6 +47,9 @@ type MirrorHistoryImage = {
     width: number;
     height: number;
     bytes: number;
+    referenceIndex?: number;
+    referenceName?: string;
+    groupIndex?: number;
 };
 
 type MirrorHistoryLog = {
@@ -56,6 +66,7 @@ type MirrorHistoryLog = {
     imageSize: ImageSize;
     quality: string;
     count: number;
+    groupCount: number;
     durationMs: number;
     status: "生成中" | "成功" | "失败";
     references: ReferenceImage[];
@@ -66,14 +77,52 @@ type MirrorHistoryLog = {
 
 type AspectRatio = "1:1" | "3:4" | "4:5" | "9:16" | "16:9";
 type ImageSize = "auto" | "1K" | "2K";
+type ProductPresence = "required" | "optional" | "forbidden";
+type ReferenceLayoutType = "product_hero" | "symptom_grid" | "doctor_endorsement" | "mechanism" | "data_proof" | "comparison";
+
+type ReferenceRule = {
+    productPresence?: ProductPresence;
+    layoutType?: ReferenceLayoutType;
+};
+
+type ParsedReferenceRules = {
+    globalExtraPrompt: string;
+    rules: Record<number, ReferenceRule>;
+};
 
 const maxProductImages = 6;
-const maxReferenceImages = 20;
+const singleModeReferenceLimit = 1;
+const batchModeReferenceLimit = 20;
 const maxMirrorHistoryLogs = 50;
-const promptTemplateStorageKey = "infinite-canvas:aesthetic-mirror:prompt-template";
+const aestheticMirrorBatchRequestGapMs = 2500;
+const aestheticMirrorBatchTransientRetryCount = 2;
+const aestheticMirrorBatchTransientRetryBaseDelayMs = 8000;
 const mirrorHistoryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "aesthetic_mirror_logs" });
-const basePrompt =
-    "基于分析参考图的视觉语言，包括构图、背景质感、信息层级、产品展示方式、视觉风格等，用产品素材图中的真实产品重新设计类似风格的爆款电商图。参考图只用于学习版式、背景、光影、排版节奏和电商视觉语言，不得把参考图里的产品主体、瓶型、标签、品牌、文字或专属图形迁移到结果中。产品素材图里的产品必须作为唯一产品主体，严格保持产品的瓶型轮廓、颜色、透明液体质感、瓶盖、标签结构、品牌标识和可见细节，不要重绘成新产品，不要替换包装，不要伪造新品牌或新标签。整体风格高级、干净，产品真实清晰、不变形，产品位置、大小、角度、透视、光影和阴影要自然匹配参考图，文字锐化清晰、无乱码，画面高清适合电商投流。不要照抄参考图的品牌、文字和专属图形。";
+const basePrompt = `System Prompt
+
+你是资深电商视觉策略师、商业摄影导演、AI 图像提示词工程师。
+
+你的任务是根据【参考图】提取可迁移的视觉风格，包括构图、背景质感、信息层级、产品展示方式、视觉风格等，用产品素材图中的真实产品重新设计类似风格的爆款电商图。并将该风格迁移到【商品图】上，生成适合图像生成模型使用的高质量prompt。
+
+你必须遵守：
+1. 只复刻风格，不复制参考图中的品牌、Logo、人物身份、受保护角色、商标、具体版式或独特版权元素。
+2. 严格保持产品的瓶形轮廓、颜色、透明液体质感、瓶盖、标签结构、品牌logo标识和文字、可见细节，不要重绘成新产品，不要替换包装，不要伪造新品牌或新标签。
+3. 产品真实清晰、不变形，产品位置、大小、角度、透视、光影和阴影要自然匹配参考图，文字锐化清晰、无乱码。
+4. 不得虚构商品不存在的功能、认证、材质或功效。
+5. 参考图中没有具体产品的，AI生成的电商图也严禁摆放产品。
+6. 用户需求与商品事实冲突时，以商品事实为准。
+7. 输出必须服务于电商转化，画面应清晰、专业、可商用。
+
+You are a senior e-commerce visual strategist, commercial photography director, and AI image prompt engineer.
+Your task is to extract transferable visual styles from the [Reference Image], including composition, background texture, information hierarchy, product display methods, visual tone and more. Redesign high-converting e-commerce product visuals in the matching style using the actual product from the product material image, then generate high-quality prompts compatible with image generation models to apply this style to the [Product Image].
+You must abide by the following rules strictly:
+1.Replicate only the visual style. Do not copy brands, logos, character identities, copyrighted characters, trademarks, exclusive layout formats or proprietary copyrighted elements from the reference image.
+2.Precisely retain the product’s bottle shape, color, transparent liquid texture, cap design, label structure, brand logo, text content and all visible details. Do not redraw it as a new product, alter packaging, fabricate fake brands or custom labels.
+3.Keep the product realistic, sharp and distortion-free. Naturally match the product’s position, scale, shooting angle, perspective, light and shadow to the reference image. Ensure all text is sharp, legible and free of garbled characters.
+4.Do not fabricate non-existent functions, certifications, materials or efficacy claims for the product.
+5.No products are allowed to be placed in the AI-generated e-commerce artwork when no specific product appears in the reference image.
+6.In case of conflicts between user requirements and the actual product attributes, always prioritize the factual specifications of the product.
+7.All outputs shall be optimized for e-commerce conversion, featuring crisp, professional visuals fully eligible for commercial use.`;
 
 const aspectRatioOptions: Array<{ label: string; value: AspectRatio; hint: string }> = [
     { label: "1:1 正方形", value: "1:1", hint: "平台主图/方形详情模块" },
@@ -101,6 +150,52 @@ const sizeMap: Record<ImageSize, Partial<Record<AspectRatio, string>>> = {
     },
 };
 
+const gptImage2StableSizeMap: Record<Exclude<ImageSize, "auto">, Record<AspectRatio, string>> = {
+    "1K": {
+        "1:1": "1024x1024",
+        "3:4": "1024x1536",
+        "4:5": "1024x1536",
+        "9:16": "1024x1536",
+        "16:9": "1536x1024",
+    },
+    "2K": {
+        "1:1": "2048x2048",
+        "3:4": "1440x2160",
+        "4:5": "1440x2160",
+        "9:16": "1440x2160",
+        "16:9": "2160x1440",
+    },
+};
+
+const aestheticMirrorGptImage2ModelAliases = new Set(["gpt-image-2", "gpt-image-2-official", "novadream-img-2"]);
+
+function normalizeAestheticMirrorModelName(model: string) {
+    return model.trim().toLowerCase();
+}
+
+function isAestheticMirrorGptImage2Model(model: string) {
+    return aestheticMirrorGptImage2ModelAliases.has(normalizeAestheticMirrorModelName(model));
+}
+
+function isAestheticMirrorApimartChannel(config: AiConfig, channelId: string, model: string) {
+    const channels =
+        config.channelMode === "remote"
+            ? config.publicChannels.map((channel) => ({ id: channel.id, name: channel.name || "云端渠道", baseUrl: channel.baseUrl, models: channel.models }))
+            : normalizeLocalChannels(config).map((channel) => ({ id: channel.id, name: channel.name || "本地渠道", baseUrl: channel.baseUrl, models: channel.models }));
+    const channel =
+        channels.find((item) => item.id === channelId && item.models.includes(model)) ||
+        channels.find((item) => item.models.includes(model)) ||
+        channels.find((item) => item.id === channelId);
+    const value = `${channel?.baseUrl || ""} ${channel?.name || ""}`.toLowerCase();
+    return value.includes("apimart.ai") || value.includes("apimart");
+}
+
+function normalizeAestheticMirrorImageSize(config: AiConfig, model: string, channelId: string, imageSize: ImageSize): ImageSize {
+    if (!isAestheticMirrorGptImage2Model(model) || !isAestheticMirrorApimartChannel(config, channelId, model)) return imageSize;
+    if (imageSize === "2K" || imageSize === "auto") return "1K";
+    return imageSize;
+}
+
 export default function AestheticMirrorPage() {
     const { message, modal } = App.useApp();
     const router = useRouter();
@@ -110,14 +205,13 @@ export default function AestheticMirrorPage() {
     const updateConfig = useConfigStore((state) => state.updateConfig);
     const isAiConfigReady = useConfigStore((state) => state.isAiConfigReady);
     const openConfigDialog = useConfigStore((state) => state.openConfigDialog);
+    const token = useUserStore((state) => state.token);
     const canvasHydrated = useCanvasStore((state) => state.hydrated);
     const createCanvasProject = useCanvasStore((state) => state.createProject);
     const updateCanvasProject = useCanvasStore((state) => state.updateProject);
+    const [mirrorMode, setMirrorMode] = useState<MirrorMode>("single");
     const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>([]);
     const [productImages, setProductImages] = useState<ReferenceImage[]>([]);
-    const [promptTemplate, setPromptTemplate] = useState(() => readStoredPromptTemplate());
-    const [promptDraft, setPromptDraft] = useState(() => readStoredPromptTemplate());
-    const [promptEditorOpen, setPromptEditorOpen] = useState(false);
     const [extraPrompt, setExtraPrompt] = useState("");
     const [model, setModel] = useState(effectiveConfig.imageModel || effectiveConfig.model);
     const [modelChannelId, setModelChannelId] = useState(effectiveConfig.imageChannelId || effectiveConfig.activeChannelId);
@@ -131,13 +225,17 @@ export default function AestheticMirrorPage() {
     const [activeHistoryLogId, setActiveHistoryLogId] = useState("");
     const [activePreview, setActivePreview] = useState<MirrorResult | null>(null);
     const [activeUploadPreview, setActiveUploadPreview] = useState<ReferenceImage | null>(null);
+    const promptTemplate = basePrompt;
 
     const isGenerating = results.some((item) => item.status === "running");
     const finalPrompt = useMemo(() => buildFinalPrompt(promptTemplate, extraPrompt), [promptTemplate, extraPrompt]);
-    const promptDraftFinal = useMemo(() => buildFinalPrompt(promptDraft, extraPrompt), [promptDraft, extraPrompt]);
+    const parsedReferenceRules = useMemo(() => parseReferenceRules(extraPrompt), [extraPrompt]);
+    const batchPromptTemplate = useMemo(() => buildBatchPromptTemplate(promptTemplate), [promptTemplate]);
+    const batchFinalPrompt = useMemo(() => buildFinalPrompt(batchPromptTemplate, parsedReferenceRules.globalExtraPrompt), [batchPromptTemplate, parsedReferenceRules.globalExtraPrompt]);
     const modelChannelName = useMemo(() => resolveModelChannelName(effectiveConfig, modelChannelId, model), [effectiveConfig, model, modelChannelId]);
-    const isBatchMode = referenceImages.length > 1;
-    const effectiveResultCount = isBatchMode ? referenceImages.length : imageCount;
+    const isBatchMode = mirrorMode === "batch";
+    const referenceLimit = isBatchMode ? batchModeReferenceLimit : singleModeReferenceLimit;
+    const effectiveResultCount = isBatchMode ? Math.max(1, referenceImages.length) * imageCount : imageCount;
     const canGenerate = referenceImages.length > 0 && productImages.length > 0 && !isGenerating;
     const successCount = results.filter((item) => item.status === "success").length;
 
@@ -150,22 +248,23 @@ export default function AestheticMirrorPage() {
         void refreshHistoryLogs();
     }, []);
 
-    useEffect(() => {
-        try {
-            window.localStorage.setItem(promptTemplateStorageKey, promptTemplate);
-        } catch {
-            // Local persistence is best-effort; generation can still proceed.
+    const changeMirrorMode = (nextMode: MirrorMode) => {
+        if (nextMode === mirrorMode) return;
+        if (nextMode === "single" && referenceImages.length > 1) {
+            setReferenceImages((items) => items.slice(0, singleModeReferenceLimit));
+            message.info("已切到单图复刻，仅保留第一张参考图");
         }
-    }, [promptTemplate]);
+        setMirrorMode(nextMode);
+    };
 
     const uploadFiles = async (sourceFiles: File[], role: UploadRole) => {
         const files = sourceFiles.filter((file) => file.type.startsWith("image/"));
         if (!files.length) return;
-        const maxImages = role === "reference" ? maxReferenceImages : maxProductImages;
+        const maxImages = role === "reference" ? referenceLimit : maxProductImages;
         const currentCount = role === "reference" ? referenceImages.length : productImages.length;
-        const limitedFiles = files.slice(0, Math.max(0, maxImages - currentCount));
+        const limitedFiles = role === "reference" && !isBatchMode ? files.slice(0, maxImages) : files.slice(0, Math.max(0, maxImages - currentCount));
         if (!limitedFiles.length) {
-            message.warning(role === "reference" ? `参考设计图最多上传 ${maxReferenceImages} 张` : `产品素材最多上传 ${maxProductImages} 张`);
+            message.warning(role === "reference" ? `参考设计图最多上传 ${maxImages} 张` : `产品素材最多上传 ${maxProductImages} 张`);
             return;
         }
         const hide = message.loading("正在读取图片...", 0);
@@ -188,7 +287,7 @@ export default function AestheticMirrorPage() {
                 }),
             );
             if (role === "reference") {
-                setReferenceImages((items) => [...items, ...nextImages].slice(0, maxReferenceImages));
+                setReferenceImages((items) => (isBatchMode ? [...items, ...nextImages].slice(0, referenceLimit) : nextImages.slice(0, referenceLimit)));
             } else {
                 setProductImages((items) => [...items, ...nextImages].slice(0, maxProductImages));
             }
@@ -213,8 +312,141 @@ export default function AestheticMirrorPage() {
         else setProductImages((items) => items.filter((item) => item.id !== id));
     };
 
+    const updateResult = (id: string, patch: Partial<MirrorResult>) => {
+        setResults((items) => items.map((item) => (item.id === id ? { ...item, ...patch } : item)));
+    };
+
+    const prepareBatchJobImage = async (image: ReferenceImage): Promise<AestheticMirrorJobImagePayload> => ({
+        name: image.name || "image.png",
+        type: image.type || "image/png",
+        storageKey: image.storageKey?.startsWith("server:") ? image.storageKey : undefined,
+        dataUrl: image.storageKey?.startsWith("server:") ? undefined : await imageToDataUrl(image),
+    });
+
+    const waitForBatchJob = async (jobId: string) => {
+        const startedAt = Date.now();
+        for (;;) {
+            const job = await fetchAestheticMirrorJob(jobId, token);
+            if (job.status === "success" || job.status === "failed") return job;
+            if (Date.now() - startedAt > 15 * 60 * 1000) throw new Error("批量复刻任务等待超时");
+            await new Promise((resolve) => window.setTimeout(resolve, 1500));
+        }
+    };
+
+    const createAndWaitForBatchJobWithRetry = async (payload: Parameters<typeof createAestheticMirrorJob>[0], slotId: string) => {
+        for (let attempt = 0; ; attempt += 1) {
+            try {
+                if (attempt > 0) {
+                    updateResult(slotId, { status: "running", error: `AI 上游繁忙，正在第 ${attempt + 1} 次尝试` });
+                }
+                const created = await createAestheticMirrorJob(payload, token);
+                updateResult(slotId, { jobId: created.id, status: created.status === "failed" ? "failed" : "running", error: created.error });
+                const completed = await waitForBatchJob(created.id);
+                if (completed.status !== "success" || !completed.imageDataUrl) throw new Error(completed.error || "接口没有返回这张图片");
+                return completed;
+            } catch (error) {
+                if (attempt >= aestheticMirrorBatchTransientRetryCount || !isTransientAestheticMirrorJobError(error)) throw error;
+                await sleep(aestheticMirrorBatchTransientRetryBaseDelayMs * (attempt + 1));
+            }
+        }
+    };
+
+    const runRemoteBatchGenerate = async (batchPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }>, requestConfig: AiConfig, requestModel: string, requestChannelId: string) => {
+        const [preparedReferences, preparedProducts] = await Promise.all([Promise.all(referenceImages.map((image) => prepareBatchJobImage(image))), Promise.all(productImages.map((image) => prepareBatchJobImage(image)))]);
+        const items: Array<
+            | {
+                  status: "success";
+                  image: { id: string; dataUrl: string; referenceIndex: number; referenceName: string; groupIndex: number };
+              }
+            | { status: "failed"; error: string }
+        > = [];
+        for (const [index, plan] of batchPlans.entries()) {
+            try {
+                updateResult(plan.slot.id, { status: "running", error: undefined });
+                const completed = await createAndWaitForBatchJobWithRetry(
+                    {
+                        prompt: plan.slot.prompt,
+                        promptTemplate,
+                        extraPrompt,
+                        model: requestModel,
+                        channelId: requestChannelId,
+                        size: requestConfig.size,
+                        quality: quality,
+                        outputFormat: "png",
+                        referenceImage: preparedReferences[plan.referenceIndex],
+                        productImages: preparedProducts,
+                        metadata: { referenceIndex: plan.referenceIndex, groupIndex: plan.groupIndex },
+                    },
+                    plan.slot.id,
+                );
+                const imageDataUrl = completed.imageDataUrl;
+                if (!imageDataUrl) throw new Error("接口没有返回这张图片");
+                const meta = await readImageMeta(imageDataUrl);
+                updateResult(plan.slot.id, { status: "success", dataUrl: imageDataUrl, width: meta.width, height: meta.height, error: undefined });
+                items.push({
+                    status: "success",
+                    image: {
+                        id: plan.slot.id,
+                        dataUrl: imageDataUrl,
+                        referenceIndex: plan.referenceIndex,
+                        referenceName: plan.reference.name,
+                        groupIndex: plan.groupIndex,
+                    },
+                });
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : "生成失败";
+                updateResult(plan.slot.id, { status: "failed", error: errorMessage });
+                items.push({ status: "failed", error: errorMessage });
+            }
+            if (index < batchPlans.length - 1) {
+                await sleep(aestheticMirrorBatchRequestGapMs);
+            }
+        }
+        return items;
+    };
+
+    const runDirectBatchGenerate = async (batchPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }>, requestConfig: AiConfig) =>
+        (async () => {
+            const items: Array<
+                | {
+                      status: "success";
+                      image: { id: string; dataUrl: string; referenceIndex: number; referenceName: string; groupIndex: number };
+                  }
+                | { status: "failed"; error: string }
+            > = [];
+            for (const [index, plan] of batchPlans.entries()) {
+                try {
+                    updateResult(plan.slot.id, { status: "running", error: undefined });
+                    const images = await requestEdit(requestConfig, plan.slot.prompt, [plan.reference, ...productImages]);
+                    const image = images[0];
+                    if (!image?.dataUrl) throw new Error("接口没有返回这张图片");
+                    const meta = await readImageMeta(image.dataUrl);
+                    updateResult(plan.slot.id, { status: "success", dataUrl: image.dataUrl, width: meta.width, height: meta.height, error: undefined });
+                    items.push({
+                        status: "success",
+                        image: {
+                            id: plan.slot.id,
+                            dataUrl: image.dataUrl,
+                            referenceIndex: plan.referenceIndex,
+                            referenceName: plan.reference.name,
+                            groupIndex: plan.groupIndex,
+                        },
+                    });
+                } catch (error) {
+                    const errorMessage = error instanceof Error ? error.message : "生成失败";
+                    updateResult(plan.slot.id, { status: "failed", error: errorMessage });
+                    items.push({ status: "failed", error: errorMessage });
+                }
+                if (index < batchPlans.length - 1) {
+                    await sleep(aestheticMirrorBatchRequestGapMs);
+                }
+            }
+            return items;
+        })();
+
     const submitGenerate = async (override?: { count?: number; replaceId?: string }) => {
-        if (!referenceImages.length) {
+        const selectedReferences = (isBatchMode ? referenceImages : referenceImages.slice(0, 1)).slice(0, referenceLimit);
+        if (!selectedReferences.length) {
             message.warning("请先上传参考设计图");
             return;
         }
@@ -230,9 +462,28 @@ export default function AestheticMirrorPage() {
             openConfigDialog(true);
             return;
         }
+        const effectiveImageSize = normalizeAestheticMirrorImageSize(requestBaseConfig, requestModel, requestChannelId, imageSize);
 
-        const isBatchRun = referenceImages.length > 1 && !override?.replaceId;
-        const count = isBatchRun ? referenceImages.length : override?.count || imageCount;
+        const isBatchRun = isBatchMode && !override?.replaceId;
+        const batchPlans = isBatchRun
+            ? selectedReferences.flatMap((reference, referenceIndex) =>
+                  Array.from({ length: imageCount }, (_, groupIndex) => ({
+                      slot: {
+                          id: nanoid(),
+                          status: "running" as const,
+                          prompt: buildBatchTaskPrompt(batchFinalPrompt, referenceIndex, groupIndex, reference.name, parsedReferenceRules.rules[referenceIndex]),
+                          referenceId: reference.id,
+                          referenceName: reference.name,
+                          referenceIndex,
+                          groupIndex,
+                      },
+                      reference,
+                      referenceIndex,
+                      groupIndex,
+                  })),
+              )
+            : [];
+        const count = isBatchRun ? batchPlans.length : override?.count || imageCount;
         const startedAt = performance.now();
         const historySnapshot = {
             prompt: finalPrompt,
@@ -242,22 +493,14 @@ export default function AestheticMirrorPage() {
             modelChannelId: requestChannelId,
             modelChannelName,
             aspectRatio,
-            imageSize,
+            imageSize: effectiveImageSize,
             quality,
             count,
-            references: [...referenceImages],
+            groupCount: isBatchRun ? imageCount : 1,
+            references: [...selectedReferences],
             products: [...productImages],
         };
-        const slots = isBatchRun
-            ? referenceImages.map((reference, index) => ({
-                  id: nanoid(),
-                  status: "running" as const,
-                  prompt: finalPrompt,
-                  referenceId: reference.id,
-                  referenceName: reference.name,
-                  referenceIndex: index,
-              }))
-            : Array.from({ length: count }, () => ({ id: nanoid(), status: "running" as const, prompt: finalPrompt }));
+        const slots = isBatchRun ? batchPlans.map((plan) => ({ ...plan.slot, status: "idle" as const })) : Array.from({ length: count }, () => ({ id: nanoid(), status: "running" as const, prompt: finalPrompt }));
         if (override?.replaceId) {
             setResults((items) => items.map((item) => (item.id === override.replaceId ? slots[0] : item)));
         } else {
@@ -268,24 +511,19 @@ export default function AestheticMirrorPage() {
         const historyLogMeta = pendingLog ? { id: pendingLog.id, createdAt: pendingLog.createdAt } : {};
 
         try {
-            const requestConfig = buildRequestConfig(requestBaseConfig, requestModel, requestChannelId, aspectRatio, imageSize, quality, isBatchRun ? 1 : count);
+            const requestConfig = buildRequestConfig(requestBaseConfig, requestModel, requestChannelId, aspectRatio, effectiveImageSize, quality, isBatchRun ? 1 : count);
             if (isBatchRun) {
-                const batchItems = await Promise.all(
-                    referenceImages.map(async (reference, index) => {
-                        try {
-                            const images = await requestEdit(requestConfig, finalPrompt, [reference, ...productImages]);
-                            const image = images[0];
-                            if (!image?.dataUrl) throw new Error("接口没有返回这张图片");
-                            setResults((items) => items.map((item) => (item.id === slots[index].id ? { ...item, status: "success", dataUrl: image.dataUrl } : item)));
-                            return { status: "success" as const, image };
-                        } catch (error) {
-                            const errorMessage = error instanceof Error ? error.message : "生成失败";
-                            setResults((items) => items.map((item) => (item.id === slots[index].id ? { ...item, status: "failed", error: errorMessage } : item)));
-                            return { status: "failed" as const, error: errorMessage };
-                        }
-                    }),
-                );
-                const images = batchItems.filter((item): item is { status: "success"; image: { id: string; dataUrl: string } } => item.status === "success").map((item) => item.image);
+                const batchItems = requestBaseConfig.channelMode === "remote" && Boolean(token) ? await runRemoteBatchGenerate(batchPlans, requestConfig, requestModel, requestChannelId) : await runDirectBatchGenerate(batchPlans, requestConfig);
+                const images = batchItems
+                    .filter(
+                        (
+                            item,
+                        ): item is {
+                            status: "success";
+                            image: { id: string; dataUrl: string; referenceIndex: number; referenceName: string; groupIndex: number };
+                        } => item.status === "success",
+                    )
+                    .map((item) => item.image);
                 const errors = batchItems.filter((item): item is { status: "failed"; error: string } => item.status === "failed").map((item) => item.error);
                 if (images.length > 0) message.success(`已生成 ${images.length}/${count} 张详情图`);
                 if (!images.length) message.error(errors[0] || "生成失败");
@@ -293,14 +531,14 @@ export default function AestheticMirrorPage() {
                 void saveHistoryFromSnapshot({ ...historySnapshot, ...historyLogMeta, status: images.length ? "成功" : "失败", images, errors, durationMs: performance.now() - startedAt });
                 return;
             }
-            const images = await requestEdit(requestConfig, finalPrompt, [...referenceImages, ...productImages]);
+            const images = await Promise.all((await requestEdit(requestConfig, finalPrompt, [...selectedReferences.slice(0, 1), ...productImages])).map((image) => enrichMirrorResultImage(image)));
             setResults((items) => {
                 const targetIds = override?.replaceId ? [slots[0].id] : slots.map((slot) => slot.id);
                 let imageIndex = 0;
                 return items.map((item) => {
                     if (!targetIds.includes(item.id)) return item;
                     const image = images[imageIndex++];
-                    if (image?.dataUrl) return { ...item, status: "success", dataUrl: image.dataUrl };
+                    if (image?.dataUrl) return { ...item, status: "success", dataUrl: image.dataUrl, width: image.width, height: image.height };
                     return { ...item, status: "failed", error: "接口没有返回这张图片" };
                 });
             });
@@ -317,33 +555,6 @@ export default function AestheticMirrorPage() {
             message.error(errorMessage);
             void saveHistoryFromSnapshot({ ...historySnapshot, ...historyLogMeta, status: "失败", images: [], errors: [errorMessage], durationMs: performance.now() - startedAt });
         }
-    };
-
-    const copyPrompt = async () => {
-        await navigator.clipboard?.writeText(finalPrompt);
-        message.success("提示词已复制");
-    };
-
-    const openPromptEditor = () => {
-        setPromptDraft(promptTemplate);
-        setPromptEditorOpen(true);
-    };
-
-    const savePromptTemplate = () => {
-        const nextPrompt = promptDraft.trim() || basePrompt;
-        setPromptTemplate(nextPrompt);
-        setPromptDraft(nextPrompt);
-        setPromptEditorOpen(false);
-        message.success("提示词已更新");
-    };
-
-    const resetPromptTemplate = () => {
-        setPromptDraft(basePrompt);
-    };
-
-    const copyPromptDraft = async () => {
-        await navigator.clipboard?.writeText(promptDraftFinal);
-        message.success("提示词已复制");
     };
 
     const downloadResult = async (result: MirrorResult) => {
@@ -367,8 +578,8 @@ export default function AestheticMirrorPage() {
             return;
         }
         try {
-            const node = buildCanvasImageNodeFromResult(result, index, aspectRatio, imageSize);
-            const projectId = createCanvasProject(`爆款复刻 方案 ${index + 1}`);
+            const node = await buildCanvasImageNodeFromResult(result, index, aspectRatio, imageSize);
+            const projectId = createCanvasProject(`爆款复刻 · ${resultDisplayTitle(result, index)}`);
             updateCanvasProject(projectId, {
                 nodes: [node],
                 connections: [],
@@ -402,10 +613,11 @@ export default function AestheticMirrorPage() {
     };
 
     const restoreHistoryLog = (log: MirrorHistoryLog) => {
-        setReferenceImages(log.references.slice(0, maxReferenceImages));
+        const nextMode: MirrorMode = log.references.length > 1 ? "batch" : "single";
+        const nextReferenceLimit = nextMode === "batch" ? batchModeReferenceLimit : singleModeReferenceLimit;
+        setMirrorMode(nextMode);
+        setReferenceImages(log.references.slice(0, nextReferenceLimit));
         setProductImages(log.products.slice(0, maxProductImages));
-        setPromptTemplate(log.promptTemplate || basePrompt);
-        setPromptDraft(log.promptTemplate || basePrompt);
         setExtraPrompt(log.extraPrompt || "");
         setModel(log.model || effectiveConfig.imageModel || effectiveConfig.model);
         setModelChannelId(log.modelChannelId || "");
@@ -414,12 +626,23 @@ export default function AestheticMirrorPage() {
         setAspectRatio(log.aspectRatio || "1:1");
         setImageSize(log.imageSize || "1K");
         setQuality(log.quality || "auto");
-        setImageCount(Math.max(1, Math.min(4, log.count || log.images.length || 2)));
+        setImageCount(nextMode === "batch" ? resolveHistoryGroupCount(log) : Math.max(1, Math.min(4, log.count || log.images.length || 1)));
         setResults(
             log.images.length
-                ? log.images.map((image, index) => {
-                      const reference = log.references[index];
-                      return { id: image.id, status: "success", prompt: log.prompt, dataUrl: image.dataUrl, referenceId: reference?.id, referenceName: reference?.name, referenceIndex: reference ? index : undefined };
+                ? log.images.map((image) => {
+                      const reference = image.referenceIndex !== undefined ? log.references[image.referenceIndex] : undefined;
+                      return {
+                          id: image.id,
+                          status: "success",
+                          prompt: log.prompt,
+                          dataUrl: image.dataUrl,
+                          width: image.width,
+                          height: image.height,
+                          referenceId: reference?.id,
+                          referenceName: image.referenceName || reference?.name,
+                          referenceIndex: image.referenceIndex,
+                          groupIndex: image.groupIndex,
+                      };
                   })
                 : [{ id: log.id, status: log.status === "生成中" ? "running" : "failed", prompt: log.prompt, error: log.errors[0] || (log.status === "生成中" ? undefined : "生成失败") }],
         );
@@ -453,7 +676,7 @@ export default function AestheticMirrorPage() {
 
     return (
         <main className="h-full overflow-hidden bg-stone-50 text-stone-950 dark:bg-[#10100f] dark:text-stone-100">
-            <input ref={referenceInputRef} hidden type="file" accept="image/*" multiple onChange={(event) => void handleUpload(event, "reference")} />
+            <input ref={referenceInputRef} hidden type="file" accept="image/*" multiple={isBatchMode} onChange={(event) => void handleUpload(event, "reference")} />
             <input ref={productInputRef} hidden type="file" accept="image/*" multiple onChange={(event) => void handleUpload(event, "product")} />
 
             <div className="grid h-full grid-cols-1 gap-3 p-3 lg:grid-cols-[390px_minmax(0,1fr)]">
@@ -467,9 +690,31 @@ export default function AestheticMirrorPage() {
                                     </span>
                                     <h1 className="truncate text-xl font-semibold tracking-normal text-stone-950 dark:text-white">爆款复刻</h1>
                                 </div>
-                                <div className="mt-2 flex flex-wrap gap-1.5">
-                                    <Tag className="m-0 border-stone-300 bg-white text-stone-700 dark:border-stone-700 dark:bg-black/50 dark:text-stone-200">Style Mirror</Tag>
-                                    <Tag className="m-0 border-stone-300 bg-stone-950 text-white dark:border-cyan-500/30 dark:bg-cyan-500/10 dark:text-cyan-200">电商投流</Tag>
+                                <div className="mt-3 flex flex-wrap gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => changeMirrorMode("single")}
+                                        className={cn(
+                                            "rounded-md border px-3 py-1.5 text-sm font-medium transition",
+                                            !isBatchMode
+                                                ? "border-stone-900 bg-stone-950 text-white dark:border-cyan-500/40 dark:bg-cyan-500/18 dark:text-cyan-100"
+                                                : "border-stone-300 bg-white text-stone-700 hover:border-stone-400 dark:border-stone-700 dark:bg-stone-950 dark:text-stone-300 dark:hover:border-stone-500 dark:hover:text-stone-100",
+                                        )}
+                                    >
+                                        单图复刻
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => changeMirrorMode("batch")}
+                                        className={cn(
+                                            "rounded-md border px-3 py-1.5 text-sm font-medium transition",
+                                            isBatchMode
+                                                ? "border-stone-900 bg-stone-950 text-white dark:border-cyan-500/40 dark:bg-cyan-500/18 dark:text-cyan-100"
+                                                : "border-stone-300 bg-white text-stone-700 hover:border-stone-400 dark:border-stone-700 dark:bg-stone-950 dark:text-stone-300 dark:hover:border-stone-500 dark:hover:text-stone-100",
+                                        )}
+                                    >
+                                        批量复刻
+                                    </button>
                                 </div>
                             </div>
                             <Tooltip title="打开模型配置">
@@ -481,10 +726,11 @@ export default function AestheticMirrorPage() {
                     <div className="thin-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
                         <UploadPanel
                             title="参考设计图"
-                            subtitle={`${referenceImages.length}/${maxReferenceImages}`}
+                            subtitle={`${referenceImages.length}/${referenceLimit}`}
                             images={referenceImages}
-                            emptyText="上传风格参考"
-                            maxImages={maxReferenceImages}
+                            emptyText={isBatchMode ? "上传多张风格参考" : "上传风格参考"}
+                            maxImages={referenceLimit}
+                            singlePreview={!isBatchMode}
                             onUpload={() => referenceInputRef.current?.click()}
                             onDropFiles={(files) => void uploadFiles(files, "reference")}
                             onPreview={(image) => setActiveUploadPreview(image)}
@@ -552,9 +798,13 @@ export default function AestheticMirrorPage() {
                                 </ControlField>
                             </div>
                             <div className="grid grid-cols-1 gap-2">
-                                <ControlField label="数量">
-                                    <Select disabled={isBatchMode} value={imageCount} options={[1, 2, 3, 4].map((value) => ({ label: `${value} 张`, value }))} onChange={setImageCount} />
-                                    {isBatchMode ? <div className="mt-1 text-xs text-stone-500">批量模式按参考图数量生成：{referenceImages.length} 张</div> : null}
+                                <ControlField label={isBatchMode ? "每张参考图生成" : "数量"}>
+                                    <Select value={imageCount} options={[1, 2, 3, 4].map((value) => ({ label: isBatchMode ? `${value} 组` : `${value} 张`, value }))} onChange={setImageCount} />
+                                    {isBatchMode ? (
+                                        <div className="mt-1 text-xs text-stone-500">
+                                            {referenceImages.length} 张参考图 × {imageCount} 组 = {effectiveResultCount} 张
+                                        </div>
+                                    ) : null}
                                 </ControlField>
                             </div>
                         </section>
@@ -566,9 +816,6 @@ export default function AestheticMirrorPage() {
                         </Button>
                         <div className="mt-2 flex items-center justify-between text-xs text-stone-500">
                             <span>{aspectRatioOptions.find((item) => item.value === aspectRatio)?.hint}</span>
-                            <button type="button" className="font-medium text-stone-600 transition hover:text-stone-950 dark:text-stone-300 dark:hover:text-white" onClick={() => void copyPrompt()}>
-                                复制提示词
-                            </button>
                         </div>
                     </div>
                 </aside>
@@ -588,9 +835,6 @@ export default function AestheticMirrorPage() {
                         <div className="flex shrink-0 gap-2">
                             <Button icon={<History className="size-4" />} onClick={() => setHistoryOpen(true)}>
                                 历史 {historyLogs.length}
-                            </Button>
-                            <Button icon={<Copy className="size-4" />} onClick={openPromptEditor}>
-                                提示词
                             </Button>
                             <Button icon={<RefreshCw className="size-4" />} disabled={isGenerating || results.length === 0} onClick={() => void submitGenerate()}>
                                 重新生成
@@ -625,37 +869,6 @@ export default function AestheticMirrorPage() {
             </Modal>
             <Modal open={Boolean(activeUploadPreview)} footer={null} onCancel={() => setActiveUploadPreview(null)} width={720} centered>
                 {activeUploadPreview ? <img src={activeUploadPreview.dataUrl} alt={activeUploadPreview.name} className="mt-6 max-h-[76vh] w-full rounded-lg object-contain" /> : null}
-            </Modal>
-            <Modal
-                title="编辑提示词"
-                open={promptEditorOpen}
-                width={820}
-                onCancel={() => setPromptEditorOpen(false)}
-                footer={[
-                    <Button key="reset" icon={<RefreshCw className="size-4" />} onClick={resetPromptTemplate}>
-                        恢复默认
-                    </Button>,
-                    <Button key="copy" icon={<Copy className="size-4" />} onClick={() => void copyPromptDraft()}>
-                        复制当前
-                    </Button>,
-                    <Button key="cancel" onClick={() => setPromptEditorOpen(false)}>
-                        取消
-                    </Button>,
-                    <Button key="save" type="primary" onClick={savePromptTemplate}>
-                        保存
-                    </Button>,
-                ]}
-            >
-                <div className="space-y-4 pt-2">
-                    <label className="block space-y-2">
-                        <span className="text-sm font-semibold text-stone-700 dark:text-stone-200">核心提示词</span>
-                        <Input.TextArea value={promptDraft} onChange={(event) => setPromptDraft(event.target.value)} autoSize={{ minRows: 8, maxRows: 14 }} placeholder="输入爆款复刻的核心提示词" showCount />
-                    </label>
-                    <div className="rounded-lg border border-stone-200 bg-stone-50 p-3 text-xs text-stone-600 dark:border-stone-800 dark:bg-[#111] dark:text-stone-300">
-                        <div className="mb-2 font-semibold">最终提交给模型</div>
-                        <div className="max-h-36 overflow-y-auto whitespace-pre-wrap leading-5">{promptDraftFinal}</div>
-                    </div>
-                </div>
             </Modal>
             <Drawer title="爆款复刻历史" placement="right" size={420} open={historyOpen} onClose={() => setHistoryOpen(false)}>
                 <MirrorHistoryPanel logs={historyLogs} activeLogId={activeHistoryLogId} onRestore={restoreHistoryLog} onDelete={(log) => void deleteHistoryLog(log)} onClear={clearHistoryLogs} />
@@ -734,9 +947,13 @@ function UploadPanel({
             {images.length && singlePreview ? (
                 <div className={cn("rounded-lg", dragging && "outline outline-2 outline-cyan-500/70 outline-offset-2")} {...dropHandlers}>
                     {images.map((image) => (
-                        <div key={image.id} className="group relative overflow-hidden rounded-lg border border-stone-200 bg-white dark:border-stone-800 dark:bg-black">
+                        <div
+                            key={image.id}
+                            className="group relative overflow-hidden rounded-lg border border-stone-200 bg-white dark:border-stone-800 dark:bg-black"
+                            style={image.width && image.height ? { aspectRatio: `${image.width} / ${image.height}` } : { aspectRatio: "1 / 1" }}
+                        >
                             <button type="button" className="block w-full cursor-zoom-in" onClick={() => onPreview?.(image)} aria-label="预览图片">
-                                <img src={image.dataUrl} alt={image.name} className="aspect-square w-full object-cover" />
+                                <img src={image.dataUrl} alt={image.name} className="h-full w-full object-contain" />
                             </button>
                             <span className="pointer-events-none absolute inset-0 bg-black/0 transition group-hover:bg-black/10 dark:group-hover:bg-white/5" />
                             <button
@@ -847,14 +1064,20 @@ function EmptyResult() {
 
 function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenCanvas }: { result: MirrorResult; index: number; aspectRatio: AspectRatio; onPreview: () => void; onDownload: () => void; onOpenCanvas: () => void }) {
     const ratioClass = aspectRatio === "16:9" ? "aspect-video" : aspectRatio === "9:16" ? "aspect-[9/16]" : aspectRatio === "3:4" ? "aspect-[3/4]" : aspectRatio === "4:5" ? "aspect-[4/5]" : "aspect-square";
-    const title = result.referenceIndex !== undefined ? `参考 ${result.referenceIndex + 1} · 详情图方案` : `详情图方案 ${index + 1}`;
+    const title = resultDisplayTitle(result, index);
+    const ratioStyle = result.width && result.height ? { aspectRatio: `${result.width} / ${result.height}` } : undefined;
     return (
         <article className="overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm dark:border-stone-800 dark:bg-[#11100f] dark:shadow-none">
-            <div className={cn("group relative grid place-items-center bg-stone-100 dark:bg-black", ratioClass)}>
+            <div className={cn("group relative grid place-items-center bg-stone-100 dark:bg-black", !ratioStyle && ratioClass)} style={ratioStyle}>
                 {result.status === "running" ? (
                     <div className="flex flex-col items-center gap-3 text-stone-500">
                         <LoaderCircle className="size-8 animate-spin text-stone-900 dark:text-stone-200" />
                         <span className="text-sm">分析风格并生成中</span>
+                    </div>
+                ) : result.status === "idle" ? (
+                    <div className="flex flex-col items-center gap-3 text-stone-500">
+                        <div className="grid size-8 place-items-center rounded-full border border-dashed border-stone-400 dark:border-stone-600" />
+                        <span className="text-sm">等待生成</span>
                     </div>
                 ) : result.status === "success" && result.dataUrl ? (
                     <Image src={result.dataUrl} alt={title} preview={false} className="h-full w-full object-cover" />
@@ -1005,11 +1228,12 @@ type MirrorHistoryBuildInput = {
     imageSize: ImageSize;
     quality: string;
     count: number;
+    groupCount: number;
     durationMs: number;
     status: MirrorHistoryLog["status"];
     references: ReferenceImage[];
     products: ReferenceImage[];
-    images: Array<{ id: string; dataUrl: string }>;
+    images: Array<{ id: string; dataUrl: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>;
     errors: string[];
 };
 
@@ -1029,6 +1253,7 @@ async function buildMirrorHistoryLog(input: MirrorHistoryBuildInput): Promise<Mi
         imageSize: input.imageSize,
         quality: input.quality,
         count: input.count,
+        groupCount: input.groupCount,
         durationMs: input.durationMs,
         status: input.status,
         references,
@@ -1067,7 +1292,7 @@ function normalizeMirrorHistoryLog(log: Partial<MirrorHistoryLog>): MirrorHistor
         createdAt: log.createdAt || Date.now(),
         title: log.title || historyTitle(log.prompt || ""),
         prompt: log.prompt || "",
-        promptTemplate: log.promptTemplate || basePrompt,
+        promptTemplate: basePrompt,
         extraPrompt: log.extraPrompt || "",
         model: log.model || "",
         modelChannelId: log.modelChannelId || "",
@@ -1075,7 +1300,8 @@ function normalizeMirrorHistoryLog(log: Partial<MirrorHistoryLog>): MirrorHistor
         aspectRatio,
         imageSize,
         quality: log.quality || "auto",
-        count: Math.max(1, Math.min(maxReferenceImages, Number(log.count) || log.images?.length || 2)),
+        count: Math.max(1, Math.min(batchModeReferenceLimit * 4, Number(log.count) || log.images?.length || 1)),
+        groupCount: Math.max(1, Math.min(4, Number(log.groupCount) || 1)),
         durationMs: log.durationMs || 0,
         status: log.status === "失败" ? "失败" : log.status === "生成中" ? "生成中" : "成功",
         references: normalizeHistoryReferences(log.references || []),
@@ -1106,7 +1332,7 @@ async function cloneHistoryReference(image: ReferenceImage): Promise<ReferenceIm
     };
 }
 
-async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string }>) {
+async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>) {
     return Promise.all(
         images.map(async (image, index) => {
             const dataUrl = await historyImageToDataUrl({ dataUrl: image.dataUrl });
@@ -1119,9 +1345,17 @@ async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string }>
                 width: meta.width,
                 height: meta.height,
                 bytes: getDataUrlByteSize(dataUrl),
+                referenceIndex: image.referenceIndex,
+                referenceName: image.referenceName,
+                groupIndex: image.groupIndex,
             };
         }),
     );
+}
+
+async function enrichMirrorResultImage<T extends { dataUrl: string }>(image: T): Promise<T & { width: number; height: number }> {
+    const meta = await readImageMeta(image.dataUrl);
+    return { ...image, width: meta.width, height: meta.height };
 }
 
 async function historyImageToDataUrl(image: { dataUrl?: string; url?: string; storageKey?: string }) {
@@ -1185,7 +1419,18 @@ function normalizeHistoryImages(images: MirrorHistoryImage[]) {
             width: image.width || 1024,
             height: image.height || 1024,
             bytes: image.bytes || getDataUrlByteSize(image.dataUrl),
+            referenceIndex: image.referenceIndex,
+            referenceName: image.referenceName,
+            groupIndex: image.groupIndex,
         }));
+}
+
+function resolveHistoryGroupCount(log: MirrorHistoryLog) {
+    if (log.groupCount > 0) return Math.max(1, Math.min(4, log.groupCount));
+    if (log.references.length > 1 && log.count > log.references.length) {
+        return Math.max(1, Math.min(4, Math.ceil(log.count / log.references.length)));
+    }
+    return Math.max(1, Math.min(4, log.count || log.images.length || 1));
 }
 
 function historyTitle(prompt: string) {
@@ -1193,32 +1438,184 @@ function historyTitle(prompt: string) {
     return compact.slice(0, 18) || "爆款复刻";
 }
 
-function readStoredPromptTemplate() {
-    if (typeof window === "undefined") return basePrompt;
-    try {
-        return window.localStorage.getItem(promptTemplateStorageKey)?.trim() || basePrompt;
-    } catch {
-        return basePrompt;
-    }
+function sleep(ms: number) {
+    return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isTransientAestheticMirrorJobError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error || "");
+    return /(Please wait|try again later|rate limit|temporar|timeout|ECONNRESET|ETIMEDOUT|上游错误|限流|繁忙|超时|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b)/i.test(message);
 }
 
 function buildFinalPrompt(promptTemplate: string, extraPrompt: string) {
     return [(promptTemplate || basePrompt).trim(), extraPrompt.trim()].filter(Boolean).join("\n\n");
 }
 
+function buildBatchPromptTemplate(promptTemplate: string) {
+    const template = (promptTemplate || basePrompt).trim();
+    const batchAwareProductRule =
+        "产品素材图里的产品需要严格保持真实外观、瓶型轮廓、颜色、透明液体质感、瓶盖、标签结构、品牌标识和可见细节，不要重绘成新产品，不要替换包装，不要伪造新品牌或新标签。是否让产品作为主视觉，优先由当前参考图的版式类型和任务要求决定：如果当前参考图是产品主视觉、卖点海报或主图，产品应作为主要主体；如果当前参考图是医生背书、症状拼图、成分机理、数据证明、对比说明等信息型版式，可以不出现产品，或仅保留极小的辅助产品元素，不要强行改成统一的居中单瓶海报。";
+    const strictProductRule = "产品素材图里的产品必须作为唯一产品主体，严格保持产品的瓶型轮廓、颜色、透明液体质感、瓶盖、标签结构、品牌标识和可见细节，不要重绘成新产品，不要替换包装，不要伪造新品牌或新标签。";
+    if (template.includes(strictProductRule)) {
+        return template.replace(strictProductRule, batchAwareProductRule);
+    }
+    return `${template}\n\n${batchAwareProductRule}`;
+}
+
+function parseReferenceRules(extraPrompt: string): ParsedReferenceRules {
+    const rules: Record<number, ReferenceRule> = {};
+    const globalSegments: string[] = [];
+    const segments = extraPrompt
+        .split(/[\n；;。]+/)
+        .map((segment) => segment.trim())
+        .filter(Boolean);
+
+    for (const segment of segments) {
+        const referenceIndexes = extractReferenceIndexes(segment);
+        if (!referenceIndexes.length) {
+            globalSegments.push(segment);
+            continue;
+        }
+
+        let matched = false;
+        const hasForbiddenProductRule = /(不需要出现产品|不要出现产品|无需出现产品|不需要产品|不要产品|无产品|不出产品|不放产品|产品不用出现)/.test(segment);
+        const hasRequiredProductRule = /(需要出现产品|必须出现产品|要出现产品|必须有产品|需要产品|要有产品|必须放产品|产品必须出现)/.test(segment);
+        if (hasForbiddenProductRule) {
+            referenceIndexes.forEach((referenceIndex) => mergeReferenceRule(rules, referenceIndex, { productPresence: "forbidden" }));
+            matched = true;
+        } else if (hasRequiredProductRule) {
+            referenceIndexes.forEach((referenceIndex) => mergeReferenceRule(rules, referenceIndex, { productPresence: "required" }));
+            matched = true;
+        }
+
+        const layoutType = inferReferenceLayoutType(segment);
+        if (layoutType) {
+            referenceIndexes.forEach((referenceIndex) =>
+                mergeReferenceRule(rules, referenceIndex, {
+                    layoutType,
+                    productPresence: rules[referenceIndex]?.productPresence || (layoutType === "product_hero" ? "required" : "optional"),
+                }),
+            );
+            matched = true;
+        }
+
+        if (!matched) {
+            globalSegments.push(segment);
+            continue;
+        }
+
+        const residual = cleanReferenceRuleSegment(segment);
+        if (residual) globalSegments.push(residual);
+    }
+
+    return {
+        globalExtraPrompt: globalSegments.join("\n").trim(),
+        rules,
+    };
+}
+
+function extractReferenceIndexes(segment: string) {
+    const match = segment.match(/(?:图|第)\s*([0-9][0-9/、,，及和\s]*)\s*(?:张|图)?/);
+    if (!match?.[1]) return [];
+    const indexes = match[1]
+        .replace(/[及和]/g, "/")
+        .split(/[\/、,，\s]+/)
+        .map((value) => Number(value.trim()))
+        .filter((value) => Number.isInteger(value) && value > 0)
+        .map((value) => value - 1);
+    return Array.from(new Set(indexes));
+}
+
+function mergeReferenceRule(rules: Record<number, ReferenceRule>, referenceIndex: number, patch: ReferenceRule) {
+    rules[referenceIndex] = { ...rules[referenceIndex], ...patch };
+}
+
+function inferReferenceLayoutType(segment: string): ReferenceLayoutType | undefined {
+    if (/(医生背书|医生图|专家背书|专家图|医师背书|临床背书|权威背书|医师图|专家肖像|医生肖像)/.test(segment)) return "doctor_endorsement";
+    if (/(症状拼图|症状图|问题拼图|场景拼图|多宫格|九宫格|拼图|痛点图|问题图)/.test(segment)) return "symptom_grid";
+    if (/(机理图|原理图|成分机理图|成分图|配方图|机制图|作用路径|分子图)/.test(segment)) return "mechanism";
+    if (/(数据证明图|数据图|检测图|证书图|证明图|认证图|实验图|报告图|检测证明|临床数据)/.test(segment)) return "data_proof";
+    if (/(对比图|前后对比|前后对照|对照图|对比说明)/.test(segment)) return "comparison";
+    if (/(主图|主视觉|单品海报|卖点海报|单瓶海报|产品海报|产品主视觉)/.test(segment)) return "product_hero";
+    return undefined;
+}
+
+function cleanReferenceRuleSegment(segment: string) {
+    return segment
+        .replace(/(?:图|第)\s*[0-9][0-9/、,，及和\s]*(?:张|图)?/g, " ")
+        .replace(/(?:都)?(?:不需要出现产品|不要出现产品|无需出现产品|不需要产品|不要产品|无产品|不出产品|不放产品|产品不用出现)/g, " ")
+        .replace(/(?:都)?(?:需要出现产品|必须出现产品|要出现产品|必须有产品|需要产品|要有产品|必须放产品|产品必须出现)/g, " ")
+        .replace(
+            /(?:做|走|改成|做成|出成)?(?:医生背书|医生图|专家背书|专家图|医师背书|临床背书|权威背书|医师图|专家肖像|医生肖像|症状拼图|症状图|问题拼图|场景拼图|多宫格|九宫格|拼图|痛点图|问题图|机理图|原理图|成分机理图|成分图|配方图|机制图|作用路径|分子图|数据证明图|数据图|检测图|证书图|证明图|认证图|实验图|报告图|检测证明|临床数据|对比图|前后对比|前后对照|对照图|对比说明|主图|主视觉|单品海报|卖点海报|单瓶海报|产品海报|产品主视觉)/g,
+            " ",
+        )
+        .replace(/^[，,、/\s]+|[，,、/\s]+$/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function buildBatchTaskPrompt(basePromptText: string, referenceIndex: number, groupIndex: number, referenceName?: string, rule?: ReferenceRule) {
+    const resolvedLayoutType = rule?.layoutType;
+    const resolvedProductPresence = rule?.productPresence || (resolvedLayoutType === "product_hero" ? "required" : resolvedLayoutType ? "optional" : undefined);
+    const label = `当前任务只对应参考图 ${referenceIndex + 1}${referenceName ? `（${referenceName}）` : ""}，当前生成第 ${groupIndex + 1} 组。只学习这一张参考图的版式、信息层级、背景氛围、构图和卖点组织，不要融合其他参考图。`;
+    const genericLayoutRule = "优先复刻当前参考图自身的版式类型。如果它是产品主视觉，就突出产品；如果它是医生背书、症状拼图、成分机理、数据证明或对比说明这类信息型版式，就优先保留信息结构，不要为了塞入产品而统一改成居中单瓶海报。";
+    const productPresenceRule =
+        resolvedProductPresence === "forbidden"
+            ? "本任务明确要求不需要出现产品。允许完全不放产品，不要在画面中央放单瓶，不要为了塞入产品打乱原有的信息分区和版式结构。"
+            : resolvedProductPresence === "required"
+              ? "本任务明确要求必须出现产品，产品应作为主视觉或主要信息锚点，且必须保持真实外观、包装、标签和品牌细节。"
+              : resolvedProductPresence === "optional"
+                ? "本任务可以不出现产品，也可以只保留极小的辅助产品元素。是否出现产品，以当前参考图的信息结构和表达目标优先。"
+                : "";
+    const layoutRule =
+        resolvedLayoutType === "doctor_endorsement"
+            ? "版式重点放在医生或专家背书、权威感、可信度和医疗信息层级，可以以人物、证书、背书文案和信任元素为主。"
+            : resolvedLayoutType === "symptom_grid"
+              ? "版式重点做成症状拼图或问题说明图，允许多宫格、多分区、症状示意、痛点说明和信息清单，信息密度可以更高。"
+              : resolvedLayoutType === "mechanism"
+                ? "版式重点做成成分机理或作用原理说明图，突出结构化说明、图标、路径、机制解释和科普信息。"
+                : resolvedLayoutType === "data_proof"
+                  ? "版式重点做成数据证明或检测认证图，突出图表、数据、证书、实验结果、检测说明和可信证据表达。"
+                  : resolvedLayoutType === "comparison"
+                    ? "版式重点做成前后对比或对照说明图，强调差异对比、结果对照、分栏信息和可读性。"
+                    : resolvedLayoutType === "product_hero"
+                      ? "版式重点做成产品主视觉海报，突出产品主体、核心卖点、品牌识别和电商投流主图感。"
+                      : "";
+    return [basePromptText.trim(), label, genericLayoutRule, productPresenceRule, layoutRule].filter(Boolean).join("\n\n");
+}
+
 function buildRequestConfig(config: AiConfig, model: string, channelId: string, aspectRatio: AspectRatio, imageSize: ImageSize, quality: string, count: number): AiConfig {
+    const normalizedImageSize = normalizeAestheticMirrorImageSize(config, model, channelId, imageSize);
     return {
         ...config,
         model,
         imageModel: model,
         imageChannelId: channelId,
         activeChannelId: channelId,
-        size: sizeMap[imageSize][aspectRatio] || aspectRatio,
+        size: resolveAestheticMirrorRequestSize(config, model, channelId, aspectRatio, normalizedImageSize),
         quality,
         count: String(count),
         outputFormat: "png",
         responseFormatB64Json: true,
     };
+}
+
+function resolveAestheticMirrorRequestSize(config: AiConfig, model: string, channelId: string, aspectRatio: AspectRatio, imageSize: ImageSize) {
+    if (imageSize === "auto") return aspectRatio;
+    if (isAestheticMirrorGptImage2Model(model)) {
+        if (isAestheticMirrorApimartChannel(config, channelId, model)) {
+            return sizeMap[imageSize][aspectRatio] || aspectRatio;
+        }
+        return gptImage2StableSizeMap[imageSize][aspectRatio];
+    }
+    return sizeMap[imageSize][aspectRatio] || aspectRatio;
+}
+
+function resultDisplayTitle(result: MirrorResult | MirrorHistoryImage, index: number) {
+    const referenceLabel = result.referenceIndex !== undefined ? `参考 ${result.referenceIndex + 1}` : "";
+    const groupLabel = result.groupIndex !== undefined ? `第 ${result.groupIndex + 1} 组` : "";
+    const labels = [referenceLabel, groupLabel].filter(Boolean);
+    return labels.length ? labels.join(" · ") : `详情图方案 ${index + 1}`;
 }
 
 function resolveModelChannelName(config: AiConfig, channelId: string, model: string) {
@@ -1229,13 +1626,14 @@ function resolveModelChannelName(config: AiConfig, channelId: string, model: str
     return channels.find((channel) => channel.id === channelId && channel.models.includes(model))?.name || channels.find((channel) => channel.models.includes(model))?.name || "";
 }
 
-function buildCanvasImageNodeFromResult(result: MirrorResult, index: number, aspectRatio: AspectRatio, imageSize: ImageSize): CanvasNodeData {
-    const image = estimateCanvasImageMeta(result.dataUrl || "", aspectRatio, imageSize);
+async function buildCanvasImageNodeFromResult(result: MirrorResult, index: number, aspectRatio: AspectRatio, imageSize: ImageSize): Promise<CanvasNodeData> {
+    const image = await estimateCanvasImageMeta(result.dataUrl || "", aspectRatio, imageSize, result.width, result.height);
     const size = fitNodeSize(image.width, image.height);
+    const title = resultDisplayTitle(result, index);
     return {
         id: `image-${Date.now()}-${nanoid().slice(0, 5)}`,
         type: CanvasNodeType.Image,
-        title: `爆款复刻 方案 ${index + 1}`,
+        title,
         position: { x: -size.width / 2, y: -size.height / 2 },
         width: size.width,
         height: size.height,
@@ -1253,9 +1651,15 @@ function buildCanvasImageNodeFromResult(result: MirrorResult, index: number, asp
     };
 }
 
-function estimateCanvasImageMeta(url: string, aspectRatio: AspectRatio, imageSize: ImageSize) {
+async function estimateCanvasImageMeta(url: string, aspectRatio: AspectRatio, imageSize: ImageSize, width?: number, height?: number) {
     const explicitSize = sizeMap[imageSize][aspectRatio];
-    const dimensions = parseCanvasImageDimensions(explicitSize || aspectRatio);
+    let dimensions = width && height ? { width, height } : parseCanvasImageDimensions(explicitSize || aspectRatio);
+    if ((!width || !height) && url.startsWith("data:")) {
+        const meta = await readImageMeta(url);
+        if (meta.width > 0 && meta.height > 0) {
+            dimensions = { width: meta.width, height: meta.height };
+        }
+    }
     return {
         url,
         width: dimensions.width,
