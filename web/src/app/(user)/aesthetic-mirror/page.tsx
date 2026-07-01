@@ -1557,8 +1557,9 @@ function cleanReferenceRuleSegment(segment: string) {
 function buildBatchTaskPrompt(basePromptText: string, referenceIndex: number, groupIndex: number, referenceName?: string, rule?: ReferenceRule) {
     const resolvedLayoutType = rule?.layoutType;
     const resolvedProductPresence = rule?.productPresence || (resolvedLayoutType === "product_hero" ? "required" : resolvedLayoutType ? "optional" : undefined);
-    const label = `当前任务只对应参考图 ${referenceIndex + 1}${referenceName ? `（${referenceName}）` : ""}，当前生成第 ${groupIndex + 1} 组。只学习这一张参考图的版式、信息层级、背景氛围、构图和卖点组织，不要融合其他参考图。`;
-    const genericLayoutRule = "优先复刻当前参考图自身的版式类型。如果它是产品主视觉，就突出产品；如果它是医生背书、症状拼图、成分机理、数据证明或对比说明这类信息型版式，就优先保留信息结构，不要为了塞入产品而统一改成居中单瓶海报。";
+    const label = `当前任务只对应参考图 ${referenceIndex + 1}${referenceName ? `（${referenceName}）` : ""}，当前生成第 ${groupIndex + 1} 组。参考图只用于学习视觉风格、信息层级、背景氛围、构图逻辑和卖点组织，不要融合其他参考图。不要把参考图当作可直接照抄的模板。`;
+    const genericLayoutRule =
+        "优先迁移当前参考图自身的版式类型，但必须重构画面细节：标题位置、分栏比例、卡片数量、图标样式、人物姿态、证书/报告摆放需要有明显变化，避免生成和参考图几乎一模一样的版面。参考图中的人物、医生、证书、报告、机构标识、品牌名、标题文案和数据只能作为类型参考，必须重新生成不同的人物形象、不同的报告卡片和不同的信息排布，不得复制原图中的人物脸、姿势、证书截图、品牌或专属文字。如果参考图是产品主视觉，就突出产品但重构构图；如果是医生背书、症状拼图、成分机理、数据证明或对比说明这类信息型版式，就优先保留信息表达方式，不要为了塞入产品而统一改成居中单瓶海报。";
     const productPresenceRule =
         resolvedProductPresence === "forbidden"
             ? "本任务明确要求不需要出现产品。允许完全不放产品，不要在画面中央放单瓶，不要为了塞入产品打乱原有的信息分区和版式结构。"

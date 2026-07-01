@@ -519,16 +519,18 @@ func buildAestheticMirrorTaskPrompt(basePrompt string, referenceIndex int, group
 	}
 
 	parts := []string{strings.TrimSpace(basePrompt)}
-	parts = append(parts, fmt.Sprintf("当前任务只对应参考图 %d，当前生成第 %d 组。只学习这一张参考图的版式、信息层级、背景氛围、构图和卖点组织，不要融合其他参考图。", referenceIndex+1, groupIndex+1))
+	parts = append(parts, fmt.Sprintf("当前任务只对应参考图 %d，当前生成第 %d 组。参考图只用于学习视觉风格、信息层级、背景氛围、构图逻辑和卖点组织，不要融合其他参考图。不要把参考图当作可直接照抄的模板。", referenceIndex+1, groupIndex+1))
 	if analysis != nil {
 		if analysis.Summary != "" {
 			parts = append(parts, "参考图结构摘要："+analysis.Summary)
 		}
 		if len(analysis.KeyElements) > 0 {
-			parts = append(parts, "当前参考图需要优先保留这些版式元素："+strings.Join(analysis.KeyElements, "、")+"。")
+			parts = append(parts, "当前参考图可迁移的视觉元素："+strings.Join(analysis.KeyElements, "、")+"。这些元素只作为风格和信息组织参考，需要重新组合，不要逐区块照搬。")
 		}
 	}
-	parts = append(parts, "优先复刻当前参考图自身的版式类型。如果它是产品主视觉，就突出产品；如果它是医生背书、症状拼图、成分机理、数据证明或对比说明这类信息型版式，就优先保留信息结构，不要为了塞入产品而统一改成居中单瓶海报。")
+	parts = append(parts, "优先迁移当前参考图自身的版式类型，但必须重构画面细节：标题位置、分栏比例、卡片数量、图标样式、人物姿态、证书/报告摆放需要有明显变化，避免生成和参考图几乎一模一样的版面。")
+	parts = append(parts, "参考图中的人物、医生、证书、报告、机构标识、品牌名、标题文案和数据只能作为类型参考，必须重新生成不同的人物形象、不同的报告卡片和不同的信息排布，不得复制原图中的人物脸、姿势、证书截图、品牌或专属文字。")
+	parts = append(parts, "如果参考图是产品主视觉，就突出产品但重构构图；如果是医生背书、症状拼图、成分机理、数据证明或对比说明这类信息型版式，就优先保留信息表达方式，不要为了塞入产品而统一改成居中单瓶海报。")
 
 	switch resolvedProductPresence {
 	case aestheticMirrorProductForbidden:
