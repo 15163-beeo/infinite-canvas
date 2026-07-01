@@ -13,8 +13,7 @@ import { fitNodeSize } from "../canvas/utils/canvas-node-size";
 import { ModelPicker } from "@/components/model-picker";
 import { getDataUrlByteSize, readImageMeta } from "@/lib/image-utils";
 import { cn } from "@/lib/utils";
-import { createAestheticMirrorJob, fetchAestheticMirrorJob, type AestheticMirrorJobImagePayload } from "@/services/api/aesthetic-mirror";
-import { requestEdit } from "@/services/api/image";
+import { createAestheticMirrorJob, fetchAestheticMirrorJob, type AestheticMirrorJob, type AestheticMirrorJobImagePayload } from "@/services/api/aesthetic-mirror";
 import { deleteStoredImages, imageToDataUrl, uploadImage } from "@/services/image-storage";
 import { normalizeLocalChannels, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
 import { useUserStore } from "@/stores/use-user-store";
@@ -22,11 +21,13 @@ import type { ReferenceImage } from "@/types/image";
 
 type UploadRole = "reference" | "product";
 type MirrorStatus = "idle" | "running" | "success" | "failed";
+type MirrorPhase = "queued" | "analyzing" | "generating" | "success" | "failed";
 type MirrorMode = "single" | "batch";
 
 type MirrorResult = {
     id: string;
     status: MirrorStatus;
+    phase?: MirrorPhase;
     prompt: string;
     jobId?: string;
     referenceId?: string;
@@ -36,6 +37,10 @@ type MirrorResult = {
     dataUrl?: string;
     width?: number;
     height?: number;
+    requestedAspectRatio?: string;
+    requestedImageSize?: string;
+    resolvedUpstreamSize?: string;
+    actualSize?: string;
     error?: string;
 };
 
@@ -50,6 +55,7 @@ type MirrorHistoryImage = {
     referenceIndex?: number;
     referenceName?: string;
     groupIndex?: number;
+    prompt?: string;
 };
 
 type MirrorHistoryLog = {
@@ -228,10 +234,6 @@ export default function AestheticMirrorPage() {
     const promptTemplate = basePrompt;
 
     const isGenerating = results.some((item) => item.status === "running");
-    const finalPrompt = useMemo(() => buildFinalPrompt(promptTemplate, extraPrompt), [promptTemplate, extraPrompt]);
-    const parsedReferenceRules = useMemo(() => parseReferenceRules(extraPrompt), [extraPrompt]);
-    const batchPromptTemplate = useMemo(() => buildBatchPromptTemplate(promptTemplate), [promptTemplate]);
-    const batchFinalPrompt = useMemo(() => buildFinalPrompt(batchPromptTemplate, parsedReferenceRules.globalExtraPrompt), [batchPromptTemplate, parsedReferenceRules.globalExtraPrompt]);
     const modelChannelName = useMemo(() => resolveModelChannelName(effectiveConfig, modelChannelId, model), [effectiveConfig, model, modelChannelId]);
     const isBatchMode = mirrorMode === "batch";
     const referenceLimit = isBatchMode ? batchModeReferenceLimit : singleModeReferenceLimit;
@@ -316,32 +318,49 @@ export default function AestheticMirrorPage() {
         setResults((items) => items.map((item) => (item.id === id ? { ...item, ...patch } : item)));
     };
 
-    const prepareBatchJobImage = async (image: ReferenceImage): Promise<AestheticMirrorJobImagePayload> => ({
+    const prepareJobImage = async (image: ReferenceImage): Promise<AestheticMirrorJobImagePayload> => ({
         name: image.name || "image.png",
         type: image.type || "image/png",
         storageKey: image.storageKey?.startsWith("server:") ? image.storageKey : undefined,
         dataUrl: image.storageKey?.startsWith("server:") ? undefined : await imageToDataUrl(image),
     });
 
-    const waitForBatchJob = async (jobId: string) => {
+    const applyJobStateToResult = (slotId: string, job: Partial<AestheticMirrorJob>) => {
+        updateResult(slotId, {
+            jobId: job.id,
+            status: job.status === "success" ? "success" : job.status === "failed" ? "failed" : "running",
+            phase: job.phase,
+            ...(job.resolvedPrompt ? { prompt: job.resolvedPrompt } : {}),
+            width: job.width,
+            height: job.height,
+            requestedAspectRatio: job.requestedAspectRatio,
+            requestedImageSize: job.requestedImageSize,
+            resolvedUpstreamSize: job.resolvedUpstreamSize,
+            actualSize: job.actualSize,
+            error: job.error,
+        });
+    };
+
+    const waitForJob = async (jobId: string, slotId: string) => {
         const startedAt = Date.now();
         for (;;) {
             const job = await fetchAestheticMirrorJob(jobId, token);
+            applyJobStateToResult(slotId, job);
             if (job.status === "success" || job.status === "failed") return job;
             if (Date.now() - startedAt > 15 * 60 * 1000) throw new Error("批量复刻任务等待超时");
             await new Promise((resolve) => window.setTimeout(resolve, 1500));
         }
     };
 
-    const createAndWaitForBatchJobWithRetry = async (payload: Parameters<typeof createAestheticMirrorJob>[0], slotId: string) => {
+    const createAndWaitForJobWithRetry = async (payload: Parameters<typeof createAestheticMirrorJob>[0], slotId: string) => {
         for (let attempt = 0; ; attempt += 1) {
             try {
                 if (attempt > 0) {
-                    updateResult(slotId, { status: "running", error: `AI 上游繁忙，正在第 ${attempt + 1} 次尝试` });
+                    updateResult(slotId, { status: "running", phase: "generating", error: `AI 上游繁忙，正在第 ${attempt + 1} 次尝试` });
                 }
                 const created = await createAestheticMirrorJob(payload, token);
-                updateResult(slotId, { jobId: created.id, status: created.status === "failed" ? "failed" : "running", error: created.error });
-                const completed = await waitForBatchJob(created.id);
+                applyJobStateToResult(slotId, created);
+                const completed = await waitForJob(created.id, slotId);
                 if (completed.status !== "success" || !completed.imageDataUrl) throw new Error(completed.error || "接口没有返回这张图片");
                 return completed;
             } catch (error) {
@@ -351,43 +370,63 @@ export default function AestheticMirrorPage() {
         }
     };
 
-    const runRemoteBatchGenerate = async (batchPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }>, requestConfig: AiConfig, requestModel: string, requestChannelId: string) => {
-        const [preparedReferences, preparedProducts] = await Promise.all([Promise.all(referenceImages.map((image) => prepareBatchJobImage(image))), Promise.all(productImages.map((image) => prepareBatchJobImage(image)))]);
+    const runMirrorJobs = async (
+        jobPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }>,
+        requestModel: string,
+        requestChannelId: string,
+        runId: string,
+        isBatchRun: boolean,
+    ) => {
+        const [preparedReferences, preparedProducts] = await Promise.all([Promise.all(referenceImages.map((image) => prepareJobImage(image))), Promise.all(productImages.map((image) => prepareJobImage(image)))]);
         const items: Array<
             | {
                   status: "success";
-                  image: { id: string; dataUrl: string; referenceIndex: number; referenceName: string; groupIndex: number };
+                  image: { id: string; dataUrl: string; prompt: string; referenceIndex: number; referenceName: string; groupIndex: number };
               }
             | { status: "failed"; error: string }
         > = [];
-        for (const [index, plan] of batchPlans.entries()) {
+        for (const [index, plan] of jobPlans.entries()) {
             try {
-                updateResult(plan.slot.id, { status: "running", error: undefined });
-                const completed = await createAndWaitForBatchJobWithRetry(
+                updateResult(plan.slot.id, { status: "running", phase: "queued", error: undefined });
+                const completed = await createAndWaitForJobWithRetry(
                     {
-                        prompt: plan.slot.prompt,
                         promptTemplate,
                         extraPrompt,
+                        userPrompt: extraPrompt,
                         model: requestModel,
                         channelId: requestChannelId,
-                        size: requestConfig.size,
+                        aspectRatio,
+                        imageSize,
                         quality: quality,
                         outputFormat: "png",
                         referenceImage: preparedReferences[plan.referenceIndex],
                         productImages: preparedProducts,
-                        metadata: { referenceIndex: plan.referenceIndex, groupIndex: plan.groupIndex },
+                        metadata: { referenceIndex: plan.referenceIndex, groupIndex: plan.groupIndex, isBatch: isBatchRun, runId },
                     },
                     plan.slot.id,
                 );
                 const imageDataUrl = completed.imageDataUrl;
                 if (!imageDataUrl) throw new Error("接口没有返回这张图片");
-                const meta = await readImageMeta(imageDataUrl);
-                updateResult(plan.slot.id, { status: "success", dataUrl: imageDataUrl, width: meta.width, height: meta.height, error: undefined });
+                applyJobStateToResult(plan.slot.id, completed);
+                updateResult(plan.slot.id, {
+                    status: "success",
+                    phase: completed.phase,
+                    prompt: completed.resolvedPrompt || plan.slot.prompt,
+                    dataUrl: imageDataUrl,
+                    width: completed.width,
+                    height: completed.height,
+                    actualSize: completed.actualSize,
+                    requestedAspectRatio: completed.requestedAspectRatio,
+                    requestedImageSize: completed.requestedImageSize,
+                    resolvedUpstreamSize: completed.resolvedUpstreamSize,
+                    error: undefined,
+                });
                 items.push({
                     status: "success",
                     image: {
                         id: plan.slot.id,
                         dataUrl: imageDataUrl,
+                        prompt: completed.resolvedPrompt || plan.slot.prompt,
                         referenceIndex: plan.referenceIndex,
                         referenceName: plan.reference.name,
                         groupIndex: plan.groupIndex,
@@ -395,58 +434,19 @@ export default function AestheticMirrorPage() {
                 });
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : "生成失败";
-                updateResult(plan.slot.id, { status: "failed", error: errorMessage });
+                updateResult(plan.slot.id, { status: "failed", phase: "failed", error: errorMessage });
                 items.push({ status: "failed", error: errorMessage });
             }
-            if (index < batchPlans.length - 1) {
+            if (index < jobPlans.length - 1) {
                 await sleep(aestheticMirrorBatchRequestGapMs);
             }
         }
         return items;
     };
 
-    const runDirectBatchGenerate = async (batchPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }>, requestConfig: AiConfig) =>
-        (async () => {
-            const items: Array<
-                | {
-                      status: "success";
-                      image: { id: string; dataUrl: string; referenceIndex: number; referenceName: string; groupIndex: number };
-                  }
-                | { status: "failed"; error: string }
-            > = [];
-            for (const [index, plan] of batchPlans.entries()) {
-                try {
-                    updateResult(plan.slot.id, { status: "running", error: undefined });
-                    const images = await requestEdit(requestConfig, plan.slot.prompt, [plan.reference, ...productImages]);
-                    const image = images[0];
-                    if (!image?.dataUrl) throw new Error("接口没有返回这张图片");
-                    const meta = await readImageMeta(image.dataUrl);
-                    updateResult(plan.slot.id, { status: "success", dataUrl: image.dataUrl, width: meta.width, height: meta.height, error: undefined });
-                    items.push({
-                        status: "success",
-                        image: {
-                            id: plan.slot.id,
-                            dataUrl: image.dataUrl,
-                            referenceIndex: plan.referenceIndex,
-                            referenceName: plan.reference.name,
-                            groupIndex: plan.groupIndex,
-                        },
-                    });
-                } catch (error) {
-                    const errorMessage = error instanceof Error ? error.message : "生成失败";
-                    updateResult(plan.slot.id, { status: "failed", error: errorMessage });
-                    items.push({ status: "failed", error: errorMessage });
-                }
-                if (index < batchPlans.length - 1) {
-                    await sleep(aestheticMirrorBatchRequestGapMs);
-                }
-            }
-            return items;
-        })();
-
     const submitGenerate = async (override?: { count?: number; replaceId?: string }) => {
-        const selectedReferences = (isBatchMode ? referenceImages : referenceImages.slice(0, 1)).slice(0, referenceLimit);
-        if (!selectedReferences.length) {
+        const availableReferences = (isBatchMode ? referenceImages : referenceImages.slice(0, 1)).slice(0, referenceLimit);
+        if (!availableReferences.length) {
             message.warning("请先上传参考设计图");
             return;
         }
@@ -462,45 +462,84 @@ export default function AestheticMirrorPage() {
             openConfigDialog(true);
             return;
         }
-        const effectiveImageSize = normalizeAestheticMirrorImageSize(requestBaseConfig, requestModel, requestChannelId, imageSize);
+        if (!token) {
+            message.warning("请先登录后再使用爆款复刻");
+            return;
+        }
 
         const isBatchRun = isBatchMode && !override?.replaceId;
-        const batchPlans = isBatchRun
-            ? selectedReferences.flatMap((reference, referenceIndex) =>
-                  Array.from({ length: imageCount }, (_, groupIndex) => ({
-                      slot: {
-                          id: nanoid(),
-                          status: "running" as const,
-                          prompt: buildBatchTaskPrompt(batchFinalPrompt, referenceIndex, groupIndex, reference.name, parsedReferenceRules.rules[referenceIndex]),
-                          referenceId: reference.id,
-                          referenceName: reference.name,
-                          referenceIndex,
-                          groupIndex,
-                      },
-                      reference,
-                      referenceIndex,
-                      groupIndex,
-                  })),
-              )
-            : [];
-        const count = isBatchRun ? batchPlans.length : override?.count || imageCount;
+        const promptDisplayText = extraPrompt.trim() || "系统模板";
+        const runId = nanoid();
+        const targetResult = override?.replaceId ? results.find((item) => item.id === override.replaceId) : undefined;
+        if (override?.replaceId && !targetResult) {
+            message.warning("没有找到要重试的图片");
+            return;
+        }
+
+        let selectedReferences = availableReferences;
+        let jobPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }> = [];
+        if (targetResult) {
+            const targetReferenceIndex = targetResult.referenceIndex ?? 0;
+            const targetReference = availableReferences[targetReferenceIndex];
+            if (!targetReference) {
+                message.warning("当前图片对应的参考图不存在");
+                return;
+            }
+            jobPlans = [
+                {
+                    slot: {
+                        id: nanoid(),
+                        status: "idle" as const,
+                        phase: "queued" as const,
+                        prompt: targetResult.prompt || promptDisplayText,
+                        referenceId: targetReference.id,
+                        referenceName: targetReference.name,
+                        referenceIndex: targetReferenceIndex,
+                        groupIndex: targetResult.groupIndex ?? 0,
+                    },
+                    reference: targetReference,
+                    referenceIndex: targetReferenceIndex,
+                    groupIndex: targetResult.groupIndex ?? 0,
+                },
+            ];
+        } else {
+            const jobCountPerReference = isBatchRun ? imageCount : Math.max(1, override?.count || imageCount);
+            jobPlans = selectedReferences.flatMap((reference, referenceIndex) =>
+                Array.from({ length: jobCountPerReference }, (_, groupIndex) => ({
+                    slot: {
+                        id: nanoid(),
+                        status: "idle" as const,
+                        phase: "queued" as const,
+                        prompt: promptDisplayText,
+                        referenceId: reference.id,
+                        referenceName: reference.name,
+                        referenceIndex,
+                        groupIndex,
+                    },
+                    reference,
+                    referenceIndex,
+                    groupIndex,
+                })),
+            );
+        }
+        const count = jobPlans.length;
         const startedAt = performance.now();
         const historySnapshot = {
-            prompt: finalPrompt,
+            prompt: promptDisplayText,
             promptTemplate,
             extraPrompt,
             model: requestModel,
             modelChannelId: requestChannelId,
             modelChannelName,
             aspectRatio,
-            imageSize: effectiveImageSize,
+            imageSize,
             quality,
             count,
-            groupCount: isBatchRun ? imageCount : 1,
+            groupCount: targetResult ? 1 : isBatchRun ? imageCount : 1,
             references: [...selectedReferences],
             products: [...productImages],
         };
-        const slots = isBatchRun ? batchPlans.map((plan) => ({ ...plan.slot, status: "idle" as const })) : Array.from({ length: count }, () => ({ id: nanoid(), status: "running" as const, prompt: finalPrompt }));
+        const slots = jobPlans.map((plan) => plan.slot);
         if (override?.replaceId) {
             setResults((items) => items.map((item) => (item.id === override.replaceId ? slots[0] : item)));
         } else {
@@ -511,45 +550,30 @@ export default function AestheticMirrorPage() {
         const historyLogMeta = pendingLog ? { id: pendingLog.id, createdAt: pendingLog.createdAt } : {};
 
         try {
-            const requestConfig = buildRequestConfig(requestBaseConfig, requestModel, requestChannelId, aspectRatio, effectiveImageSize, quality, isBatchRun ? 1 : count);
-            if (isBatchRun) {
-                const batchItems = requestBaseConfig.channelMode === "remote" && Boolean(token) ? await runRemoteBatchGenerate(batchPlans, requestConfig, requestModel, requestChannelId) : await runDirectBatchGenerate(batchPlans, requestConfig);
-                const images = batchItems
-                    .filter(
-                        (
-                            item,
-                        ): item is {
-                            status: "success";
-                            image: { id: string; dataUrl: string; referenceIndex: number; referenceName: string; groupIndex: number };
-                        } => item.status === "success",
-                    )
-                    .map((item) => item.image);
-                const errors = batchItems.filter((item): item is { status: "failed"; error: string } => item.status === "failed").map((item) => item.error);
-                if (images.length > 0) message.success(`已生成 ${images.length}/${count} 张详情图`);
-                if (!images.length) message.error(errors[0] || "生成失败");
-                else if (errors.length) message.warning(`有 ${errors.length} 张生成失败`);
-                void saveHistoryFromSnapshot({ ...historySnapshot, ...historyLogMeta, status: images.length ? "成功" : "失败", images, errors, durationMs: performance.now() - startedAt });
-                return;
+            const jobItems = await runMirrorJobs(jobPlans, requestModel, requestChannelId, runId, isBatchRun);
+            const images = jobItems
+                .filter(
+                    (
+                        item,
+                    ): item is {
+                        status: "success";
+                        image: { id: string; dataUrl: string; prompt: string; referenceIndex: number; referenceName: string; groupIndex: number };
+                    } => item.status === "success",
+                )
+                .map((item) => item.image);
+            const errors = jobItems.filter((item): item is { status: "failed"; error: string } => item.status === "failed").map((item) => item.error);
+            if (images.length > 0) {
+                message.success(isBatchRun ? `已生成 ${images.length}/${count} 张详情图` : `已生成 ${images.length} 张详情图`);
             }
-            const images = await Promise.all((await requestEdit(requestConfig, finalPrompt, [...selectedReferences.slice(0, 1), ...productImages])).map((image) => enrichMirrorResultImage(image)));
-            setResults((items) => {
-                const targetIds = override?.replaceId ? [slots[0].id] : slots.map((slot) => slot.id);
-                let imageIndex = 0;
-                return items.map((item) => {
-                    if (!targetIds.includes(item.id)) return item;
-                    const image = images[imageIndex++];
-                    if (image?.dataUrl) return { ...item, status: "success", dataUrl: image.dataUrl, width: image.width, height: image.height };
-                    return { ...item, status: "failed", error: "接口没有返回这张图片" };
-                });
-            });
-            if (images.length > 0) message.success(`已生成 ${images.length} 张详情图`);
-            void saveHistoryFromSnapshot({ ...historySnapshot, ...historyLogMeta, status: "成功", images, errors: [], durationMs: performance.now() - startedAt });
+            if (!images.length) message.error(errors[0] || "生成失败");
+            else if (errors.length) message.warning(`有 ${errors.length} 张生成失败`);
+            void saveHistoryFromSnapshot({ ...historySnapshot, ...historyLogMeta, status: images.length ? "成功" : "失败", images, errors, durationMs: performance.now() - startedAt });
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : "生成失败";
             setResults((items) =>
                 items.map((item) => {
-                    const target = override?.replaceId ? item.id === slots[0].id : slots.some((slot) => slot.id === item.id);
-                    return target ? { ...item, status: "failed", error: errorMessage } : item;
+                    const target = override?.replaceId ? item.id === override.replaceId : slots.some((slot) => slot.id === item.id);
+                    return target ? { ...item, status: "failed", phase: "failed", error: errorMessage } : item;
                 }),
             );
             message.error(errorMessage);
@@ -634,7 +658,8 @@ export default function AestheticMirrorPage() {
                       return {
                           id: image.id,
                           status: "success",
-                          prompt: log.prompt,
+                          phase: "success",
+                          prompt: image.prompt || log.prompt,
                           dataUrl: image.dataUrl,
                           width: image.width,
                           height: image.height,
@@ -644,7 +669,7 @@ export default function AestheticMirrorPage() {
                           groupIndex: image.groupIndex,
                       };
                   })
-                : [{ id: log.id, status: log.status === "生成中" ? "running" : "failed", prompt: log.prompt, error: log.errors[0] || (log.status === "生成中" ? undefined : "生成失败") }],
+                : [{ id: log.id, status: log.status === "生成中" ? "running" : "failed", phase: log.status === "生成中" ? "generating" : "failed", prompt: log.prompt, error: log.errors[0] || (log.status === "生成中" ? undefined : "生成失败") }],
         );
         setActiveHistoryLogId(log.id);
         setHistoryOpen(false);
@@ -832,14 +857,11 @@ export default function AestheticMirrorPage() {
                             </div>
                             <p className="mt-1 truncate text-xs text-stone-500">参考设计图学习风格，产品素材图保持主体一致。</p>
                         </div>
-                        <div className="flex shrink-0 gap-2">
-                            <Button icon={<History className="size-4" />} onClick={() => setHistoryOpen(true)}>
-                                历史 {historyLogs.length}
-                            </Button>
-                            <Button icon={<RefreshCw className="size-4" />} disabled={isGenerating || results.length === 0} onClick={() => void submitGenerate()}>
-                                重新生成
-                            </Button>
-                        </div>
+                    <div className="flex shrink-0 gap-2">
+                        <Button icon={<History className="size-4" />} onClick={() => setHistoryOpen(true)}>
+                            历史 {historyLogs.length}
+                        </Button>
+                    </div>
                     </div>
 
                     <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto p-4">
@@ -853,9 +875,11 @@ export default function AestheticMirrorPage() {
                                         result={result}
                                         index={index}
                                         aspectRatio={aspectRatio}
+                                        retryDisabled={isGenerating}
                                         onPreview={() => setActivePreview(result)}
                                         onDownload={() => void downloadResult(result)}
                                         onOpenCanvas={() => void openResultInCanvas(result, index)}
+                                        onRetry={() => void submitGenerate({ replaceId: result.id })}
                                     />
                                 ))}
                             </div>
@@ -1062,7 +1086,25 @@ function EmptyResult() {
     );
 }
 
-function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenCanvas }: { result: MirrorResult; index: number; aspectRatio: AspectRatio; onPreview: () => void; onDownload: () => void; onOpenCanvas: () => void }) {
+function ResultCard({
+    result,
+    index,
+    aspectRatio,
+    retryDisabled = false,
+    onPreview,
+    onDownload,
+    onOpenCanvas,
+    onRetry,
+}: {
+    result: MirrorResult;
+    index: number;
+    aspectRatio: AspectRatio;
+    retryDisabled?: boolean;
+    onPreview: () => void;
+    onDownload: () => void;
+    onOpenCanvas: () => void;
+    onRetry: () => void;
+}) {
     const ratioClass = aspectRatio === "16:9" ? "aspect-video" : aspectRatio === "9:16" ? "aspect-[9/16]" : aspectRatio === "3:4" ? "aspect-[3/4]" : aspectRatio === "4:5" ? "aspect-[4/5]" : "aspect-square";
     const title = resultDisplayTitle(result, index);
     const ratioStyle = result.width && result.height ? { aspectRatio: `${result.width} / ${result.height}` } : undefined;
@@ -1072,7 +1114,7 @@ function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenC
                 {result.status === "running" ? (
                     <div className="flex flex-col items-center gap-3 text-stone-500">
                         <LoaderCircle className="size-8 animate-spin text-stone-900 dark:text-stone-200" />
-                        <span className="text-sm">分析风格并生成中</span>
+                        <span className="text-sm">{statusText(result.status, result.phase)}</span>
                     </div>
                 ) : result.status === "idle" ? (
                     <div className="flex flex-col items-center gap-3 text-stone-500">
@@ -1082,13 +1124,21 @@ function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenC
                 ) : result.status === "success" && result.dataUrl ? (
                     <Image src={result.dataUrl} alt={title} preview={false} className="h-full w-full object-cover" />
                 ) : (
-                    <div className="px-6 text-center text-sm text-red-600 dark:text-red-300">{result.error || "生成失败"}</div>
+                    <div className="flex flex-col items-center gap-3 px-6 text-center">
+                        <div className="text-sm text-red-600 dark:text-red-300">{result.error || "生成失败"}</div>
+                        <Button icon={<RefreshCw className="size-4" />} disabled={retryDisabled} onClick={onRetry}>
+                            重试
+                        </Button>
+                    </div>
                 )}
                 <span className="absolute left-2 top-2 rounded border border-stone-200 bg-white/90 px-2 py-1 text-xs font-medium text-stone-700 shadow-sm dark:border-stone-700 dark:bg-black/80 dark:text-stone-100 dark:shadow-none">#{index + 1}</span>
                 {result.status === "success" && result.dataUrl ? (
                     <>
                         <div className="pointer-events-none absolute inset-0 z-10 bg-black/35 opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-focus-within:opacity-100" />
                         <div className="absolute inset-0 z-20 flex scale-95 items-center justify-center gap-2 opacity-0 transition duration-200 group-hover:scale-100 group-hover:opacity-100 group-focus-within:scale-100 group-focus-within:opacity-100">
+                            <Tooltip title="重试">
+                                <Button shape="circle" icon={<RefreshCw className="size-4" />} aria-label="重试" disabled={retryDisabled} className="border-0 bg-white/95 text-stone-700 shadow-lg backdrop-blur hover:!bg-white hover:!text-stone-950" onClick={onRetry} />
+                            </Tooltip>
                             <Tooltip title="放大预览">
                                 <Button shape="circle" icon={<Eye className="size-4" />} aria-label="放大预览" className="border-0 bg-white/95 text-stone-700 shadow-lg backdrop-blur hover:!bg-white hover:!text-stone-950" onClick={onPreview} />
                             </Tooltip>
@@ -1106,7 +1156,12 @@ function ResultCard({ result, index, aspectRatio, onPreview, onDownload, onOpenC
                 <div className="min-w-0">
                     <div className="truncate text-sm font-semibold text-stone-950 dark:text-white">{title}</div>
                     {result.referenceName ? <div className="mt-0.5 truncate text-xs text-stone-500">{result.referenceName}</div> : null}
-                    <div className="mt-0.5 text-xs text-stone-500">{statusText(result.status)}</div>
+                    <div className="mt-0.5 text-xs text-stone-500">{statusText(result.status, result.phase)}</div>
+                    {result.actualSize || result.resolvedUpstreamSize ? (
+                        <div className="mt-0.5 text-[11px] text-stone-400">
+                            {[result.actualSize ? `返回 ${result.actualSize}` : "", result.resolvedUpstreamSize ? `请求 ${result.resolvedUpstreamSize}` : ""].filter(Boolean).join(" · ")}
+                        </div>
+                    ) : null}
                 </div>
             </div>
         </article>
@@ -1233,7 +1288,7 @@ type MirrorHistoryBuildInput = {
     status: MirrorHistoryLog["status"];
     references: ReferenceImage[];
     products: ReferenceImage[];
-    images: Array<{ id: string; dataUrl: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>;
+    images: Array<{ id: string; dataUrl: string; prompt?: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>;
     errors: string[];
 };
 
@@ -1332,7 +1387,7 @@ async function cloneHistoryReference(image: ReferenceImage): Promise<ReferenceIm
     };
 }
 
-async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>) {
+async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string; prompt?: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>) {
     return Promise.all(
         images.map(async (image, index) => {
             const dataUrl = await historyImageToDataUrl({ dataUrl: image.dataUrl });
@@ -1348,6 +1403,7 @@ async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string; r
                 referenceIndex: image.referenceIndex,
                 referenceName: image.referenceName,
                 groupIndex: image.groupIndex,
+                prompt: image.prompt,
             };
         }),
     );
@@ -1422,6 +1478,7 @@ function normalizeHistoryImages(images: MirrorHistoryImage[]) {
             referenceIndex: image.referenceIndex,
             referenceName: image.referenceName,
             groupIndex: image.groupIndex,
+            prompt: image.prompt,
         }));
 }
 
@@ -1684,8 +1741,12 @@ function initialCenteredCanvasViewport() {
     return { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2), k: 1 };
 }
 
-function statusText(status: MirrorStatus) {
-    if (status === "running") return "生成中";
+function statusText(status: MirrorStatus, phase?: MirrorPhase) {
+    if (status === "running") {
+        if (phase === "analyzing") return "分析参考图";
+        if (phase === "generating") return "生成中";
+        return "排队中";
+    }
     if (status === "success") return "已完成";
     if (status === "failed") return "失败";
     return "等待中";

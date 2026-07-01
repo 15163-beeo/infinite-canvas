@@ -10,12 +10,15 @@ export type AestheticMirrorJobImagePayload = {
 };
 
 export type AestheticMirrorJobPayload = {
-    prompt: string;
+    prompt?: string;
     promptTemplate?: string;
     extraPrompt?: string;
+    userPrompt?: string;
     model: string;
     channelId: string;
-    size: string;
+    aspectRatio?: string;
+    imageSize?: string;
+    size?: string;
     quality: string;
     outputFormat: "png" | "jpeg" | "webp";
     referenceImage: AestheticMirrorJobImagePayload;
@@ -23,14 +26,24 @@ export type AestheticMirrorJobPayload = {
     metadata: {
         referenceIndex: number;
         groupIndex: number;
+        isBatch?: boolean;
+        runId?: string;
     };
 };
 
 export type AestheticMirrorJob = {
     id: string;
     status: "queued" | "running" | "success" | "failed";
+    phase: "queued" | "analyzing" | "generating" | "success" | "failed";
     referenceIndex: number;
     groupIndex: number;
+    resolvedPrompt?: string;
+    requestedAspectRatio?: string;
+    requestedImageSize?: string;
+    resolvedUpstreamSize?: string;
+    actualSize?: string;
+    width?: number;
+    height?: number;
     imageDataUrl?: string;
     error?: string;
     createdAt: number;

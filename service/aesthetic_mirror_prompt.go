@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/basketikun/infinite-canvas/model"
 	"github.com/basketikun/infinite-canvas/repository"
@@ -63,17 +64,54 @@ var (
 	aestheticMirrorProductHeroPattern      = regexp.MustCompile(`主图|主视觉|单品海报|卖点海报|单瓶海报|产品海报|产品主视觉`)
 	aestheticMirrorLayoutCleanupPattern    = regexp.MustCompile(`(?:做|走|改成|做成|出成)?(?:医生背书|医生图|专家背书|专家图|医师背书|临床背书|权威背书|医师图|专家肖像|医生肖像|症状拼图|症状图|问题拼图|场景拼图|多宫格|九宫格|拼图|痛点图|问题图|机理图|原理图|成分机理图|成分图|配方图|机制图|作用路径|分子图|数据证明图|数据图|检测图|证书图|证明图|认证图|实验图|报告图|检测证明|临床数据|对比图|前后对比|前后对照|对照图|对比说明|主图|主视觉|单品海报|卖点海报|单瓶海报|产品海报|产品主视觉)`)
 	aestheticMirrorSplitRunes              = map[rune]bool{'\n': true, '；': true, ';': true, '。': true}
+	aestheticMirrorReferenceAnalysisCache  = struct {
+		mu    sync.RWMutex
+		items map[string]*aestheticMirrorReferenceAnalysis
+	}{
+		items: map[string]*aestheticMirrorReferenceAnalysis{},
+	}
 )
+
+const aestheticMirrorBasePrompt = `System Prompt
+
+你是资深电商视觉策略师、商业摄影导演、AI 图像提示词工程师。
+
+你的任务是根据【参考图】提取可迁移的视觉风格，包括构图、背景质感、信息层级、产品展示方式、视觉风格等，用产品素材图中的真实产品重新设计类似风格的爆款电商图。并将该风格迁移到【商品图】上，生成适合图像生成模型使用的高质量prompt。
+
+你必须遵守：
+1. 只复刻风格，不复制参考图中的品牌、Logo、人物身份、受保护角色、商标、具体版式或独特版权元素。
+2. 严格保持产品的瓶形轮廓、颜色、透明液体质感、瓶盖、标签结构、品牌logo标识和文字、可见细节，不要重绘成新产品，不要替换包装，不要伪造新品牌或新标签。
+3. 产品真实清晰、不变形，产品位置、大小、角度、透视、光影和阴影要自然匹配参考图，文字锐化清晰、无乱码。
+4. 不得虚构商品不存在的功能、认证、材质或功效。
+5. 参考图中没有具体产品的，AI生成的电商图也严禁摆放产品。
+6. 用户需求与商品事实冲突时，以商品事实为准。
+7. 输出必须服务于电商转化，画面应清晰、专业、可商用。
+
+You are a senior e-commerce visual strategist, commercial photography director, and AI image prompt engineer.
+Your task is to extract transferable visual styles from the [Reference Image], including composition, background texture, information hierarchy, product display methods, visual tone and more. Redesign high-converting e-commerce product visuals in the matching style using the actual product from the product material image, then generate high-quality prompts compatible with image generation models to apply this style to the [Product Image].
+You must abide by the following rules strictly:
+1.Replicate only the visual style. Do not copy brands, logos, character identities, copyrighted characters, trademarks, exclusive layout formats or proprietary copyrighted elements from the reference image.
+2.Precisely retain the product’s bottle shape, color, transparent liquid texture, cap design, label structure, brand logo, text content and all visible details. Do not redraw it as a new product, alter packaging, fabricate fake brands or custom labels.
+3.Keep the product realistic, sharp and distortion-free. Naturally match the product’s position, scale, shooting angle, perspective, light and shadow to the reference image. Ensure all text is sharp, legible and free of garbled characters.
+4.Do not fabricate non-existent functions, certifications, materials or efficacy claims for the product.
+5.No products are allowed to be placed in the AI-generated e-commerce artwork when no specific product appears in the reference image.
+6.In case of conflicts between user requirements and the actual product attributes, always prioritize the factual specifications of the product.
+7.All outputs shall be optimized for e-commerce conversion, featuring crisp, professional visuals fully eligible for commercial use.`
 
 func buildAestheticMirrorJobPrompt(ctx context.Context, user model.AuthUser, input AestheticMirrorJobCreateInput) string {
 	fallbackPrompt := strings.TrimSpace(input.Prompt)
-	template := strings.TrimSpace(input.PromptTemplate)
+	template := strings.TrimSpace(firstNonEmptyString(input.PromptTemplate, aestheticMirrorBasePrompt))
 	if template == "" {
-		return fallbackPrompt
+		return firstNonEmptyString(fallbackPrompt, strings.TrimSpace(firstNonEmptyString(input.UserPrompt, input.ExtraPrompt)))
 	}
 
-	parsedRules := parseAestheticMirrorReferenceRules(input.ExtraPrompt)
-	basePrompt := buildAestheticMirrorFinalPrompt(buildAestheticMirrorBatchPromptTemplate(template), parsedRules.GlobalExtraPrompt)
+	userPrompt := strings.TrimSpace(firstNonEmptyString(input.UserPrompt, input.ExtraPrompt))
+	parsedRules := parseAestheticMirrorReferenceRules(userPrompt)
+	baseTemplate := template
+	if input.Metadata.IsBatch {
+		baseTemplate = buildAestheticMirrorBatchPromptTemplate(template)
+	}
+	basePrompt := buildAestheticMirrorFinalPrompt(baseTemplate, parsedRules.GlobalExtraPrompt)
 	rule := parsedRules.Rules[input.Metadata.ReferenceIndex]
 	analysis, err := analyzeAestheticMirrorReference(ctx, user, input)
 	if err != nil {
@@ -92,6 +130,10 @@ func buildAestheticMirrorJobPrompt(ctx context.Context, user model.AuthUser, inp
 }
 
 func analyzeAestheticMirrorReference(ctx context.Context, user model.AuthUser, input AestheticMirrorJobCreateInput) (*aestheticMirrorReferenceAnalysis, error) {
+	if cached := loadCachedAestheticMirrorReferenceAnalysis(user, input); cached != nil {
+		return cached, nil
+	}
+
 	modelName := resolveAestheticMirrorAnalysisModel()
 	if modelName == "" {
 		return nil, errors.New("未找到可用文本模型")
@@ -164,7 +206,64 @@ func analyzeAestheticMirrorReference(ctx context.Context, user model.AuthUser, i
 		return nil, readAdminChannelError(responseBody, response.StatusCode, "爆款复刻参考图分析失败")
 	}
 
-	return parseAestheticMirrorReferenceAnalysis(extractChatCompletionContent(responseBody))
+	analysis, err := parseAestheticMirrorReferenceAnalysis(extractChatCompletionContent(responseBody))
+	if err != nil {
+		return nil, err
+	}
+	storeCachedAestheticMirrorReferenceAnalysis(user, input, analysis)
+	return analysis, nil
+}
+
+func loadCachedAestheticMirrorReferenceAnalysis(user model.AuthUser, input AestheticMirrorJobCreateInput) *aestheticMirrorReferenceAnalysis {
+	key := buildAestheticMirrorReferenceAnalysisCacheKey(user, input)
+	if key == "" {
+		return nil
+	}
+	aestheticMirrorReferenceAnalysisCache.mu.RLock()
+	defer aestheticMirrorReferenceAnalysisCache.mu.RUnlock()
+	cached := aestheticMirrorReferenceAnalysisCache.items[key]
+	if cached == nil {
+		return nil
+	}
+	clone := *cached
+	clone.KeyElements = append([]string(nil), cached.KeyElements...)
+	return &clone
+}
+
+func storeCachedAestheticMirrorReferenceAnalysis(user model.AuthUser, input AestheticMirrorJobCreateInput, analysis *aestheticMirrorReferenceAnalysis) {
+	key := buildAestheticMirrorReferenceAnalysisCacheKey(user, input)
+	if key == "" || analysis == nil {
+		return
+	}
+	clone := *analysis
+	clone.KeyElements = append([]string(nil), analysis.KeyElements...)
+	aestheticMirrorReferenceAnalysisCache.mu.Lock()
+	defer aestheticMirrorReferenceAnalysisCache.mu.Unlock()
+	if len(aestheticMirrorReferenceAnalysisCache.items) >= 512 {
+		aestheticMirrorReferenceAnalysisCache.items = map[string]*aestheticMirrorReferenceAnalysis{}
+	}
+	aestheticMirrorReferenceAnalysisCache.items[key] = &clone
+}
+
+func buildAestheticMirrorReferenceAnalysisCacheKey(user model.AuthUser, input AestheticMirrorJobCreateInput) string {
+	runID := strings.TrimSpace(input.Metadata.RunID)
+	if runID == "" || strings.TrimSpace(user.ID) == "" {
+		return ""
+	}
+	referenceKey := aestheticMirrorJobImageIdentity(input.ReferenceImage)
+	if referenceKey == "" {
+		return ""
+	}
+	productKeys := make([]string, 0, 2)
+	for index, image := range input.ProductImages {
+		if index >= 2 {
+			break
+		}
+		if key := aestheticMirrorJobImageIdentity(image); key != "" {
+			productKeys = append(productKeys, key)
+		}
+	}
+	return strings.Join([]string{user.ID, runID, referenceKey, strings.Join(productKeys, ",")}, "|")
 }
 
 func resolveAestheticMirrorAnalysisModel() string {

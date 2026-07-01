@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	_ "image/png"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -25,12 +27,21 @@ import (
 )
 
 type AestheticMirrorJobStatus string
+type AestheticMirrorJobPhase string
 
 const (
 	AestheticMirrorJobQueued  AestheticMirrorJobStatus = "queued"
 	AestheticMirrorJobRunning AestheticMirrorJobStatus = "running"
 	AestheticMirrorJobSuccess AestheticMirrorJobStatus = "success"
 	AestheticMirrorJobFailed  AestheticMirrorJobStatus = "failed"
+)
+
+const (
+	AestheticMirrorJobPhaseQueued     AestheticMirrorJobPhase = "queued"
+	AestheticMirrorJobPhaseAnalyzing  AestheticMirrorJobPhase = "analyzing"
+	AestheticMirrorJobPhaseGenerating AestheticMirrorJobPhase = "generating"
+	AestheticMirrorJobPhaseSuccess    AestheticMirrorJobPhase = "success"
+	AestheticMirrorJobPhaseFailed     AestheticMirrorJobPhase = "failed"
 )
 
 const (
@@ -44,6 +55,7 @@ const (
 	aestheticMirrorAPIMartGptImage2OfficialModel  = "gpt-image-2-official"
 	aestheticMirrorAPIMartTaskPollInterval        = 3 * time.Second
 	aestheticMirrorAPIMartGptImage2MaxWaitSeconds = 240
+	aestheticMirrorAspectRatioTolerance           = 0.03
 )
 
 type AestheticMirrorJobImageInput struct {
@@ -54,16 +66,21 @@ type AestheticMirrorJobImageInput struct {
 }
 
 type AestheticMirrorJobMetadata struct {
-	ReferenceIndex int `json:"referenceIndex"`
-	GroupIndex     int `json:"groupIndex"`
+	ReferenceIndex int    `json:"referenceIndex"`
+	GroupIndex     int    `json:"groupIndex"`
+	IsBatch        bool   `json:"isBatch"`
+	RunID          string `json:"runId"`
 }
 
 type AestheticMirrorJobCreateInput struct {
 	Prompt         string                         `json:"prompt"`
 	PromptTemplate string                         `json:"promptTemplate"`
 	ExtraPrompt    string                         `json:"extraPrompt"`
+	UserPrompt     string                         `json:"userPrompt"`
 	Model          string                         `json:"model"`
 	ChannelID      string                         `json:"channelId"`
+	AspectRatio    string                         `json:"aspectRatio"`
+	ImageSize      string                         `json:"imageSize"`
 	Size           string                         `json:"size"`
 	Quality        string                         `json:"quality"`
 	OutputFormat   string                         `json:"outputFormat"`
@@ -73,15 +90,76 @@ type AestheticMirrorJobCreateInput struct {
 }
 
 type AestheticMirrorJob struct {
-	ID             string                   `json:"id"`
-	Status         AestheticMirrorJobStatus `json:"status"`
-	ReferenceIndex int                      `json:"referenceIndex"`
-	GroupIndex     int                      `json:"groupIndex"`
-	ImageDataURL   string                   `json:"imageDataUrl,omitempty"`
-	Error          string                   `json:"error,omitempty"`
-	CreatedAt      int64                    `json:"createdAt"`
-	StartedAt      int64                    `json:"startedAt,omitempty"`
-	FinishedAt     int64                    `json:"finishedAt,omitempty"`
+	ID                   string                   `json:"id"`
+	Status               AestheticMirrorJobStatus `json:"status"`
+	Phase                AestheticMirrorJobPhase  `json:"phase"`
+	ReferenceIndex       int                      `json:"referenceIndex"`
+	GroupIndex           int                      `json:"groupIndex"`
+	ResolvedPrompt       string                   `json:"resolvedPrompt,omitempty"`
+	RequestedAspectRatio string                   `json:"requestedAspectRatio,omitempty"`
+	RequestedImageSize   string                   `json:"requestedImageSize,omitempty"`
+	ResolvedUpstreamSize string                   `json:"resolvedUpstreamSize,omitempty"`
+	ActualSize           string                   `json:"actualSize,omitempty"`
+	Width                int                      `json:"width,omitempty"`
+	Height               int                      `json:"height,omitempty"`
+	ImageDataURL         string                   `json:"imageDataUrl,omitempty"`
+	Error                string                   `json:"error,omitempty"`
+	CreatedAt            int64                    `json:"createdAt"`
+	StartedAt            int64                    `json:"startedAt,omitempty"`
+	FinishedAt           int64                    `json:"finishedAt,omitempty"`
+}
+
+type aestheticMirrorJobExecutionResult struct {
+	ImageDataURL         string
+	ResolvedPrompt       string
+	RequestedAspectRatio string
+	RequestedImageSize   string
+	ResolvedUpstreamSize string
+	ActualSize           string
+	Width                int
+	Height               int
+}
+
+type aestheticMirrorJobProgress struct {
+	Phase                AestheticMirrorJobPhase
+	ResolvedPrompt       string
+	RequestedAspectRatio string
+	RequestedImageSize   string
+	ResolvedUpstreamSize string
+}
+
+var aestheticMirrorSizeMap = map[string]map[string]string{
+	"1K": {
+		"1:1":  "1024x1024",
+		"3:4":  "768x1024",
+		"4:5":  "896x1120",
+		"9:16": "720x1280",
+		"16:9": "1280x720",
+	},
+	"2K": {
+		"1:1":  "2048x2048",
+		"3:4":  "1536x2048",
+		"4:5":  "1792x2240",
+		"9:16": "1440x2560",
+		"16:9": "2560x1440",
+	},
+}
+
+var aestheticMirrorGptImage2StableSizeMap = map[string]map[string]string{
+	"1K": {
+		"1:1":  "1024x1024",
+		"3:4":  "1024x1536",
+		"4:5":  "1024x1536",
+		"9:16": "1024x1536",
+		"16:9": "1536x1024",
+	},
+	"2K": {
+		"1:1":  "2048x2048",
+		"3:4":  "1440x2160",
+		"4:5":  "1440x2160",
+		"9:16": "1440x2160",
+		"16:9": "2160x1440",
+	},
 }
 
 type aestheticMirrorStoredJob struct {
@@ -108,10 +186,7 @@ func CreateAestheticMirrorJob(ctx context.Context, token string, input Aesthetic
 		return AestheticMirrorJob{}, safeMessageError{message: "未登录或权限不足"}
 	}
 	if strings.TrimSpace(token) == "" {
-		return AestheticMirrorJob{}, safeMessageError{message: "请先登录后再使用批量复刻"}
-	}
-	if strings.TrimSpace(input.Prompt) == "" {
-		return AestheticMirrorJob{}, safeMessageError{message: "提示词不能为空"}
+		return AestheticMirrorJob{}, safeMessageError{message: "请先登录后再使用爆款复刻"}
 	}
 	if strings.TrimSpace(input.Model) == "" {
 		return AestheticMirrorJob{}, safeMessageError{message: "模型不能为空"}
@@ -128,6 +203,7 @@ func CreateAestheticMirrorJob(ctx context.Context, token string, input Aesthetic
 		AestheticMirrorJob: AestheticMirrorJob{
 			ID:             uuid.NewString(),
 			Status:         AestheticMirrorJobQueued,
+			Phase:          AestheticMirrorJobPhaseQueued,
 			ReferenceIndex: input.Metadata.ReferenceIndex,
 			GroupIndex:     input.Metadata.GroupIndex,
 			CreatedAt:      now,
@@ -180,15 +256,35 @@ func (manager *aestheticMirrorJobManager) run(jobID string, user model.AuthUser,
 
 	manager.update(jobID, func(job *aestheticMirrorStoredJob) {
 		job.Status = AestheticMirrorJobRunning
+		job.Phase = AestheticMirrorJobPhaseAnalyzing
 		job.StartedAt = time.Now().UnixMilli()
 		job.Error = ""
 	})
 
-	imageDataURL, err := executeAestheticMirrorJob(user, token, input)
+	result, err := executeAestheticMirrorJob(user, token, input, func(progress aestheticMirrorJobProgress) {
+		manager.update(jobID, func(job *aestheticMirrorStoredJob) {
+			if progress.Phase != "" {
+				job.Phase = progress.Phase
+			}
+			if strings.TrimSpace(progress.ResolvedPrompt) != "" {
+				job.ResolvedPrompt = progress.ResolvedPrompt
+			}
+			if strings.TrimSpace(progress.RequestedAspectRatio) != "" {
+				job.RequestedAspectRatio = progress.RequestedAspectRatio
+			}
+			if strings.TrimSpace(progress.RequestedImageSize) != "" {
+				job.RequestedImageSize = progress.RequestedImageSize
+			}
+			if strings.TrimSpace(progress.ResolvedUpstreamSize) != "" {
+				job.ResolvedUpstreamSize = progress.ResolvedUpstreamSize
+			}
+		})
+	})
 	finishedAt := time.Now().UnixMilli()
 	if err != nil {
 		manager.update(jobID, func(job *aestheticMirrorStoredJob) {
 			job.Status = AestheticMirrorJobFailed
+			job.Phase = AestheticMirrorJobPhaseFailed
 			job.Error = err.Error()
 			job.FinishedAt = finishedAt
 		})
@@ -197,15 +293,33 @@ func (manager *aestheticMirrorJobManager) run(jobID string, user model.AuthUser,
 
 	manager.update(jobID, func(job *aestheticMirrorStoredJob) {
 		job.Status = AestheticMirrorJobSuccess
-		job.ImageDataURL = imageDataURL
+		job.Phase = AestheticMirrorJobPhaseSuccess
+		job.ResolvedPrompt = result.ResolvedPrompt
+		job.RequestedAspectRatio = result.RequestedAspectRatio
+		job.RequestedImageSize = result.RequestedImageSize
+		job.ResolvedUpstreamSize = result.ResolvedUpstreamSize
+		job.ActualSize = result.ActualSize
+		job.Width = result.Width
+		job.Height = result.Height
+		job.ImageDataURL = result.ImageDataURL
 		job.Error = ""
 		job.FinishedAt = finishedAt
 	})
 }
 
-func executeAestheticMirrorJob(user model.AuthUser, token string, input AestheticMirrorJobCreateInput) (string, error) {
+func executeAestheticMirrorJob(user model.AuthUser, token string, input AestheticMirrorJobCreateInput, notify func(aestheticMirrorJobProgress)) (aestheticMirrorJobExecutionResult, error) {
 	requestCtx, cancel := context.WithTimeout(context.Background(), aestheticMirrorJobTimeout)
 	defer cancel()
+
+	requestedAspectRatio := resolveAestheticMirrorRequestedAspectRatio(input)
+	requestedImageSize := resolveAestheticMirrorRequestedImageSize(input)
+	if notify != nil {
+		notify(aestheticMirrorJobProgress{
+			Phase:                AestheticMirrorJobPhaseAnalyzing,
+			RequestedAspectRatio: requestedAspectRatio,
+			RequestedImageSize:   requestedImageSize,
+		})
+	}
 
 	resolvedPrompt := buildAestheticMirrorJobPrompt(requestCtx, user, input)
 	if strings.TrimSpace(resolvedPrompt) == "" {
@@ -213,12 +327,22 @@ func executeAestheticMirrorJob(user model.AuthUser, token string, input Aestheti
 	}
 	if strings.TrimSpace(resolvedPrompt) == "" {
 		log.Printf("aesthetic mirror resolved prompt empty reference=%d group=%d", input.Metadata.ReferenceIndex, input.Metadata.GroupIndex)
-		return "", safeMessageError{message: "批量复刻提示词不能为空"}
+		return aestheticMirrorJobExecutionResult{}, safeMessageError{message: "爆款复刻提示词不能为空"}
 	}
 
 	channel, err := SelectModelChannelForModel(strings.TrimSpace(input.Model), strings.TrimSpace(input.ChannelID))
 	if err != nil {
-		return "", err
+		return aestheticMirrorJobExecutionResult{}, err
+	}
+	resolvedUpstreamSize := resolveAestheticMirrorUpstreamSize(channel, input, requestedAspectRatio, requestedImageSize)
+	if notify != nil {
+		notify(aestheticMirrorJobProgress{
+			Phase:                AestheticMirrorJobPhaseGenerating,
+			ResolvedPrompt:       resolvedPrompt,
+			RequestedAspectRatio: requestedAspectRatio,
+			RequestedImageSize:   requestedImageSize,
+			ResolvedUpstreamSize: resolvedUpstreamSize,
+		})
 	}
 	if isAestheticMirrorAPIMartChannel(channel) {
 		aestheticMirrorAPIMartLimit <- struct{}{}
@@ -231,33 +355,39 @@ func executeAestheticMirrorJob(user model.AuthUser, token string, input Aestheti
 		var imageDataURL string
 		var err error
 		if useAPIMartGenerationFlow {
-			imageDataURL, err = submitAestheticMirrorAPIMartGeneration(requestCtx, user, token, input, resolvedPrompt)
+			imageDataURL, err = submitAestheticMirrorAPIMartGeneration(requestCtx, user, token, input, resolvedPrompt, resolvedUpstreamSize)
 		} else {
-			imageDataURL, err = submitAestheticMirrorEdit(requestCtx, user, token, input, resolvedPrompt)
+			imageDataURL, err = submitAestheticMirrorEdit(requestCtx, user, token, input, resolvedPrompt, resolvedUpstreamSize)
+		}
+		var meta aestheticMirrorJobExecutionResult
+		if err == nil {
+			meta, err = validateAestheticMirrorResultDimensions(imageDataURL, requestedAspectRatio, resolvedUpstreamSize)
 		}
 		if err == nil {
-			err = validateAestheticMirrorResultSize(imageDataURL, input.Size)
-		}
-		if err == nil {
-			return imageDataURL, nil
+			meta.ImageDataURL = imageDataURL
+			meta.ResolvedPrompt = resolvedPrompt
+			meta.RequestedAspectRatio = requestedAspectRatio
+			meta.RequestedImageSize = requestedImageSize
+			meta.ResolvedUpstreamSize = resolvedUpstreamSize
+			return meta, nil
 		}
 		lastErr = err
 		if !shouldRetryAestheticMirrorError(channel, err, attempt) {
-			return "", err
+			return aestheticMirrorJobExecutionResult{}, err
 		}
 		delay := aestheticMirrorRetryDelay(attempt)
 		log.Printf("aesthetic mirror upstream retry scheduled channel=%s reference=%d group=%d attempt=%d/%d delay=%s err=%v", channel.Name, input.Metadata.ReferenceIndex, input.Metadata.GroupIndex, attempt, aestheticMirrorRetryAttempts, delay, err)
 		select {
 		case <-time.After(delay):
 		case <-requestCtx.Done():
-			return "", safeMessageError{message: "批量复刻任务等待超时"}
+			return aestheticMirrorJobExecutionResult{}, safeMessageError{message: "爆款复刻任务等待超时"}
 		}
 	}
 
-	return "", lastErr
+	return aestheticMirrorJobExecutionResult{}, lastErr
 }
 
-func submitAestheticMirrorEdit(requestCtx context.Context, user model.AuthUser, token string, input AestheticMirrorJobCreateInput, resolvedPrompt string) (string, error) {
+func submitAestheticMirrorEdit(requestCtx context.Context, user model.AuthUser, token string, input AestheticMirrorJobCreateInput, resolvedPrompt string, resolvedUpstreamSize string) (string, error) {
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
@@ -270,7 +400,7 @@ func submitAestheticMirrorEdit(requestCtx context.Context, user model.AuthUser, 
 		"n":               "1",
 		"response_format": "b64_json",
 	}
-	if size := strings.TrimSpace(input.Size); size != "" && size != "auto" {
+	if size := strings.TrimSpace(resolvedUpstreamSize); size != "" && size != "auto" {
 		fields["size"] = size
 	}
 	if quality := strings.TrimSpace(input.Quality); quality != "" && quality != "auto" {
@@ -313,7 +443,7 @@ func submitAestheticMirrorEdit(requestCtx context.Context, user model.AuthUser, 
 
 	response, err := (&http.Client{Timeout: aestheticMirrorJobTimeout}).Do(request)
 	if err != nil {
-		return "", safeMessageError{message: "批量复刻任务提交失败：" + err.Error()}
+		return "", safeMessageError{message: "爆款复刻任务提交失败：" + err.Error()}
 	}
 	defer response.Body.Close()
 
@@ -324,7 +454,7 @@ func submitAestheticMirrorEdit(requestCtx context.Context, user model.AuthUser, 
 	return parseAestheticMirrorResponse(requestCtx, responseBody)
 }
 
-func submitAestheticMirrorAPIMartGeneration(requestCtx context.Context, user model.AuthUser, token string, input AestheticMirrorJobCreateInput, resolvedPrompt string) (string, error) {
+func submitAestheticMirrorAPIMartGeneration(requestCtx context.Context, user model.AuthUser, token string, input AestheticMirrorJobCreateInput, resolvedPrompt string, resolvedUpstreamSize string) (string, error) {
 	images := append([]AestheticMirrorJobImageInput{input.ReferenceImage}, input.ProductImages...)
 	imageURLs := make([]string, 0, len(images))
 	for index, image := range images {
@@ -342,11 +472,11 @@ func submitAestheticMirrorAPIMartGeneration(requestCtx context.Context, user mod
 		"model":             aestheticMirrorAPIMartGptImage2Model,
 		"prompt":            resolvedPrompt,
 		"n":                 1,
-		"resolution":        aestheticMirrorAPIMartResolutionForSize(input.Size),
+		"resolution":        aestheticMirrorAPIMartResolutionForSize(resolvedUpstreamSize),
 		"image_urls":        imageURLs,
 		"official_fallback": true,
 	}
-	if size := strings.TrimSpace(input.Size); size != "" && size != "auto" {
+	if size := strings.TrimSpace(resolvedUpstreamSize); size != "" && size != "auto" {
 		payload["size"] = size
 	}
 
@@ -366,7 +496,7 @@ func submitAestheticMirrorAPIMartGeneration(requestCtx context.Context, user mod
 
 	response, err := (&http.Client{Timeout: aestheticMirrorJobTimeout}).Do(request)
 	if err != nil {
-		return "", safeMessageError{message: "批量复刻任务提交失败：" + err.Error()}
+		return "", safeMessageError{message: "爆款复刻任务提交失败：" + err.Error()}
 	}
 	defer response.Body.Close()
 
@@ -575,16 +705,20 @@ func isAestheticMirrorAPIMartChannel(channel model.ModelChannel) bool {
 	return strings.Contains(value, "apimart.ai") || strings.Contains(value, "apimart")
 }
 
-func isAestheticMirrorAPIMartGptImage2Channel(channel model.ModelChannel, modelName string) bool {
-	if !isAestheticMirrorAPIMartChannel(channel) {
-		return false
-	}
+func isAestheticMirrorGptImage2ModelName(modelName string) bool {
 	switch strings.ToLower(strings.TrimSpace(modelName)) {
 	case aestheticMirrorAPIMartGptImage2Model, aestheticMirrorAPIMartGptImage2OfficialModel, "novadream-img-2":
 		return true
 	default:
 		return false
 	}
+}
+
+func isAestheticMirrorAPIMartGptImage2Channel(channel model.ModelChannel, modelName string) bool {
+	if !isAestheticMirrorAPIMartChannel(channel) {
+		return false
+	}
+	return isAestheticMirrorGptImage2ModelName(modelName)
 }
 
 func shouldRetryAestheticMirrorError(channel model.ModelChannel, err error, attempt int) bool {
@@ -822,19 +956,21 @@ func parseAestheticMirrorPixelSize(size string) (int, int, bool) {
 	return width, height, width > 0 && height > 0
 }
 
-func validateAestheticMirrorResultSize(imageDataURL string, requestedSize string) error {
-	expectedWidth, expectedHeight, ok := parseAestheticMirrorPixelSize(requestedSize)
-	if !ok || strings.TrimSpace(imageDataURL) == "" {
-		return nil
-	}
-	actualWidth, actualHeight, ok := parseAestheticMirrorImageDataURLSize(imageDataURL)
+func validateAestheticMirrorResultDimensions(imageDataURL string, requestedAspectRatio string, resolvedUpstreamSize string) (aestheticMirrorJobExecutionResult, error) {
+	width, height, ok := parseAestheticMirrorImageDataURLSize(imageDataURL)
 	if !ok {
-		return nil
+		return aestheticMirrorJobExecutionResult{}, nil
 	}
-	if actualWidth == expectedWidth && actualHeight == expectedHeight {
-		return nil
+	actualSize := fmt.Sprintf("%dx%d", width, height)
+	expectedRatio, expectedLabel, ok := resolveAestheticMirrorExpectedRatio(resolvedUpstreamSize, requestedAspectRatio)
+	if !ok {
+		return aestheticMirrorJobExecutionResult{ActualSize: actualSize, Width: width, Height: height}, nil
 	}
-	return safeMessageError{message: fmt.Sprintf("生成图片尺寸不匹配，期望 %dx%d，实际 %dx%d，正在重试", expectedWidth, expectedHeight, actualWidth, actualHeight)}
+	actualRatio := float64(width) / float64(height)
+	if math.Abs(actualRatio-expectedRatio) <= aestheticMirrorAspectRatioTolerance {
+		return aestheticMirrorJobExecutionResult{ActualSize: actualSize, Width: width, Height: height}, nil
+	}
+	return aestheticMirrorJobExecutionResult{ActualSize: actualSize, Width: width, Height: height}, safeMessageError{message: fmt.Sprintf("生成图片比例不匹配，期望 %s，实际 %s，正在重试", expectedLabel, actualSize)}
 }
 
 func parseAestheticMirrorImageDataURLSize(value string) (int, int, bool) {
@@ -847,6 +983,152 @@ func parseAestheticMirrorImageDataURLSize(value string) (int, int, bool) {
 		return 0, 0, false
 	}
 	return config.Width, config.Height, config.Width > 0 && config.Height > 0
+}
+
+func resolveAestheticMirrorExpectedRatio(resolvedUpstreamSize string, requestedAspectRatio string) (float64, string, bool) {
+	if width, height, ok := parseAestheticMirrorPixelSize(resolvedUpstreamSize); ok {
+		return float64(width) / float64(height), strings.TrimSpace(resolvedUpstreamSize), true
+	}
+	if width, height, ok := parseAestheticMirrorAspectRatio(requestedAspectRatio); ok {
+		return float64(width) / float64(height), strings.TrimSpace(requestedAspectRatio), true
+	}
+	return 0, "", false
+}
+
+func resolveAestheticMirrorRequestedAspectRatio(input AestheticMirrorJobCreateInput) string {
+	if ratio := normalizeAestheticMirrorAspectRatio(input.AspectRatio); ratio != "" {
+		return ratio
+	}
+	if ratio := normalizeAestheticMirrorAspectRatio(input.Size); ratio != "" {
+		return ratio
+	}
+	if width, height, ok := parseAestheticMirrorPixelSize(input.Size); ok {
+		if ratio := nearestAestheticMirrorAspectRatio(width, height); ratio != "" {
+			return ratio
+		}
+	}
+	return "1:1"
+}
+
+func resolveAestheticMirrorRequestedImageSize(input AestheticMirrorJobCreateInput) string {
+	if size := normalizeAestheticMirrorImageSizeLabel(input.ImageSize); size != "" {
+		return size
+	}
+	legacy := strings.ToUpper(strings.TrimSpace(input.Size))
+	switch legacy {
+	case "AUTO":
+		return "auto"
+	case "1K", "2K":
+		return legacy
+	}
+	if ratio := normalizeAestheticMirrorAspectRatio(input.Size); ratio != "" {
+		_ = ratio
+		return "auto"
+	}
+	if width, height, ok := parseAestheticMirrorPixelSize(input.Size); ok {
+		longSide := width
+		if height > longSide {
+			longSide = height
+		}
+		if longSide >= 1800 {
+			return "2K"
+		}
+		return "1K"
+	}
+	return "1K"
+}
+
+func resolveAestheticMirrorUpstreamSize(channel model.ModelChannel, input AestheticMirrorJobCreateInput, requestedAspectRatio string, requestedImageSize string) string {
+	if strings.TrimSpace(input.AspectRatio) == "" && strings.TrimSpace(input.ImageSize) == "" {
+		legacySize := strings.TrimSpace(input.Size)
+		if legacySize != "" {
+			return legacySize
+		}
+	}
+	normalizedImageSize := normalizeAestheticMirrorImageSizeForChannel(channel, input.Model, requestedImageSize)
+	if normalizedImageSize == "auto" {
+		return firstNonEmptyString(requestedAspectRatio, "1:1")
+	}
+	if isAestheticMirrorAPIMartGptImage2Channel(channel, input.Model) {
+		return firstNonEmptyString(aestheticMirrorSizeMap[normalizedImageSize][requestedAspectRatio], requestedAspectRatio, "1:1")
+	}
+	if isAestheticMirrorGptImage2ModelName(input.Model) {
+		return firstNonEmptyString(aestheticMirrorGptImage2StableSizeMap[normalizedImageSize][requestedAspectRatio], requestedAspectRatio, "1:1")
+	}
+	return firstNonEmptyString(aestheticMirrorSizeMap[normalizedImageSize][requestedAspectRatio], requestedAspectRatio, "1:1")
+}
+
+func normalizeAestheticMirrorImageSizeForChannel(channel model.ModelChannel, modelName string, imageSize string) string {
+	normalized := normalizeAestheticMirrorImageSizeLabel(imageSize)
+	if normalized == "" {
+		normalized = "1K"
+	}
+	if !isAestheticMirrorAPIMartGptImage2Channel(channel, modelName) {
+		return normalized
+	}
+	if normalized == "2K" || normalized == "auto" {
+		return "1K"
+	}
+	return normalized
+}
+
+func normalizeAestheticMirrorImageSizeLabel(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "AUTO":
+		return "auto"
+	case "1K":
+		return "1K"
+	case "2K":
+		return "2K"
+	default:
+		return ""
+	}
+}
+
+func normalizeAestheticMirrorAspectRatio(value string) string {
+	switch strings.TrimSpace(value) {
+	case "1:1", "3:4", "4:5", "9:16", "16:9":
+		return strings.TrimSpace(value)
+	default:
+		return ""
+	}
+}
+
+func parseAestheticMirrorAspectRatio(value string) (int, int, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	var width int
+	var height int
+	if _, err := fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &width); err != nil {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &height); err != nil {
+		return 0, 0, false
+	}
+	return width, height, width > 0 && height > 0
+}
+
+func nearestAestheticMirrorAspectRatio(width int, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+	target := float64(width) / float64(height)
+	bestRatio := ""
+	bestDiff := math.MaxFloat64
+	for _, candidate := range []string{"1:1", "3:4", "4:5", "9:16", "16:9"} {
+		candidateWidth, candidateHeight, ok := parseAestheticMirrorAspectRatio(candidate)
+		if !ok {
+			continue
+		}
+		diff := math.Abs(target - (float64(candidateWidth) / float64(candidateHeight)))
+		if diff < bestDiff {
+			bestDiff = diff
+			bestRatio = candidate
+		}
+	}
+	return bestRatio
 }
 
 func aestheticMirrorLocalAPIURL(path string) string {
@@ -876,6 +1158,24 @@ func fileExtForAestheticMirrorMime(mimeType string) string {
 	default:
 		return ".png"
 	}
+}
+
+func aestheticMirrorJobImageIdentity(input AestheticMirrorJobImageInput) string {
+	if storageKey := strings.TrimSpace(input.StorageKey); storageKey != "" {
+		return "storage:" + storageKey
+	}
+	if dataURL := strings.TrimSpace(input.DataURL); dataURL != "" {
+		return "data:" + hashAestheticMirrorIdentity(dataURL)
+	}
+	if name := strings.TrimSpace(input.Name); name != "" {
+		return "name:" + name
+	}
+	return ""
+}
+
+func hashAestheticMirrorIdentity(value string) string {
+	sum := sha1.Sum([]byte(value))
+	return fmt.Sprintf("%x", sum[:8])
 }
 
 func firstNonEmptyString(values ...string) string {

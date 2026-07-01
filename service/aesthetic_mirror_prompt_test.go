@@ -52,13 +52,17 @@ func TestBuildAestheticMirrorTaskPromptPrefersExplicitRule(t *testing.T) {
 	}
 }
 
-func TestValidateAestheticMirrorResultSize(t *testing.T) {
+func TestValidateAestheticMirrorResultDimensions(t *testing.T) {
 	dataURL := testAestheticMirrorPNGDataURL(t, 12, 16)
-	if err := validateAestheticMirrorResultSize(dataURL, "12x16"); err != nil {
+	if _, err := validateAestheticMirrorResultDimensions(dataURL, "3:4", "12x16"); err != nil {
 		t.Fatalf("expected matching size to pass: %v", err)
 	}
-	if err := validateAestheticMirrorResultSize(dataURL, "16x16"); err == nil || !strings.Contains(err.Error(), "尺寸不匹配") {
-		t.Fatalf("expected size mismatch error, got %v", err)
+	if _, err := validateAestheticMirrorResultDimensions(dataURL, "3:4", "16x16"); err == nil || !strings.Contains(err.Error(), "比例不匹配") {
+		t.Fatalf("expected aspect mismatch error, got %v", err)
+	}
+	legacyCompatible := testAestheticMirrorPNGDataURL(t, 8, 12)
+	if _, err := validateAestheticMirrorResultDimensions(legacyCompatible, "3:4", "8x12"); err != nil {
+		t.Fatalf("expected upstream size ratio to pass legacy-compatible shape: %v", err)
 	}
 }
 
