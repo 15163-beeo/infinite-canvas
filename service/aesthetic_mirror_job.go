@@ -45,9 +45,8 @@ const (
 )
 
 const (
-	aestheticMirrorJobConcurrency = 6
-	aestheticMirrorJobTimeout     = 15 * time.Minute
-	aestheticMirrorRetryAttempts  = 6
+	aestheticMirrorJobTimeout    = 15 * time.Minute
+	aestheticMirrorRetryAttempts = 6
 )
 
 const (
@@ -168,17 +167,13 @@ type aestheticMirrorStoredJob struct {
 }
 
 type aestheticMirrorJobManager struct {
-	mu    sync.RWMutex
-	jobs  map[string]aestheticMirrorStoredJob
-	limit chan struct{}
+	mu   sync.RWMutex
+	jobs map[string]aestheticMirrorStoredJob
 }
 
 var mirrorJobs = &aestheticMirrorJobManager{
-	jobs:  map[string]aestheticMirrorStoredJob{},
-	limit: make(chan struct{}, aestheticMirrorJobConcurrency),
+	jobs: map[string]aestheticMirrorStoredJob{},
 }
-
-var aestheticMirrorAPIMartLimit = make(chan struct{}, 1)
 
 func CreateAestheticMirrorJob(ctx context.Context, token string, input AestheticMirrorJobCreateInput) (AestheticMirrorJob, error) {
 	user, ok := UserFromContext(ctx)
@@ -251,9 +246,6 @@ func (manager *aestheticMirrorJobManager) update(id string, mutate func(*aesthet
 }
 
 func (manager *aestheticMirrorJobManager) run(jobID string, user model.AuthUser, token string, input AestheticMirrorJobCreateInput) {
-	manager.limit <- struct{}{}
-	defer func() { <-manager.limit }()
-
 	manager.update(jobID, func(job *aestheticMirrorStoredJob) {
 		job.Status = AestheticMirrorJobRunning
 		job.Phase = AestheticMirrorJobPhaseAnalyzing
@@ -343,10 +335,6 @@ func executeAestheticMirrorJob(user model.AuthUser, token string, input Aestheti
 			RequestedImageSize:   requestedImageSize,
 			ResolvedUpstreamSize: resolvedUpstreamSize,
 		})
-	}
-	if isAestheticMirrorAPIMartChannel(channel) {
-		aestheticMirrorAPIMartLimit <- struct{}{}
-		defer func() { <-aestheticMirrorAPIMartLimit }()
 	}
 	useAPIMartGenerationFlow := isAestheticMirrorAPIMartGptImage2Channel(channel, input.Model)
 

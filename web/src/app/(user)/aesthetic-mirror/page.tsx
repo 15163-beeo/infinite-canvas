@@ -100,7 +100,6 @@ const maxProductImages = 6;
 const singleModeReferenceLimit = 1;
 const batchModeReferenceLimit = 20;
 const maxMirrorHistoryLogs = 50;
-const aestheticMirrorBatchRequestGapMs = 2500;
 const aestheticMirrorBatchTransientRetryCount = 2;
 const aestheticMirrorBatchTransientRetryBaseDelayMs = 8000;
 const mirrorHistoryStore = localforage.createInstance({ name: "infinite-canvas", storeName: "aesthetic_mirror_logs" });
@@ -378,70 +377,61 @@ export default function AestheticMirrorPage() {
         isBatchRun: boolean,
     ) => {
         const [preparedReferences, preparedProducts] = await Promise.all([Promise.all(referenceImages.map((image) => prepareJobImage(image))), Promise.all(productImages.map((image) => prepareJobImage(image)))]);
-        const items: Array<
-            | {
-                  status: "success";
-                  image: { id: string; dataUrl: string; prompt: string; referenceIndex: number; referenceName: string; groupIndex: number };
-              }
-            | { status: "failed"; error: string }
-        > = [];
-        for (const [index, plan] of jobPlans.entries()) {
-            try {
-                updateResult(plan.slot.id, { status: "running", phase: "queued", error: undefined });
-                const completed = await createAndWaitForJobWithRetry(
-                    {
-                        promptTemplate,
-                        extraPrompt,
-                        userPrompt: extraPrompt,
-                        model: requestModel,
-                        channelId: requestChannelId,
-                        aspectRatio,
-                        imageSize,
-                        quality: quality,
-                        outputFormat: "png",
-                        referenceImage: preparedReferences[plan.referenceIndex],
-                        productImages: preparedProducts,
-                        metadata: { referenceIndex: plan.referenceIndex, groupIndex: plan.groupIndex, isBatch: isBatchRun, runId },
-                    },
-                    plan.slot.id,
-                );
-                const imageDataUrl = completed.imageDataUrl;
-                if (!imageDataUrl) throw new Error("接口没有返回这张图片");
-                applyJobStateToResult(plan.slot.id, completed);
-                updateResult(plan.slot.id, {
-                    status: "success",
-                    phase: completed.phase,
-                    prompt: completed.resolvedPrompt || plan.slot.prompt,
-                    dataUrl: imageDataUrl,
-                    width: completed.width,
-                    height: completed.height,
-                    actualSize: completed.actualSize,
-                    requestedAspectRatio: completed.requestedAspectRatio,
-                    requestedImageSize: completed.requestedImageSize,
-                    resolvedUpstreamSize: completed.resolvedUpstreamSize,
-                    error: undefined,
-                });
-                items.push({
-                    status: "success",
-                    image: {
-                        id: plan.slot.id,
-                        dataUrl: imageDataUrl,
+        return Promise.all(
+            jobPlans.map(async (plan) => {
+                try {
+                    updateResult(plan.slot.id, { status: "running", phase: "queued", error: undefined });
+                    const completed = await createAndWaitForJobWithRetry(
+                        {
+                            promptTemplate,
+                            extraPrompt,
+                            userPrompt: extraPrompt,
+                            model: requestModel,
+                            channelId: requestChannelId,
+                            aspectRatio,
+                            imageSize,
+                            quality: quality,
+                            outputFormat: "png",
+                            referenceImage: preparedReferences[plan.referenceIndex],
+                            productImages: preparedProducts,
+                            metadata: { referenceIndex: plan.referenceIndex, groupIndex: plan.groupIndex, isBatch: isBatchRun, runId },
+                        },
+                        plan.slot.id,
+                    );
+                    const imageDataUrl = completed.imageDataUrl;
+                    if (!imageDataUrl) throw new Error("接口没有返回这张图片");
+                    applyJobStateToResult(plan.slot.id, completed);
+                    updateResult(plan.slot.id, {
+                        status: "success",
+                        phase: completed.phase,
                         prompt: completed.resolvedPrompt || plan.slot.prompt,
-                        referenceIndex: plan.referenceIndex,
-                        referenceName: plan.reference.name,
-                        groupIndex: plan.groupIndex,
-                    },
-                });
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : "生成失败";
-                updateResult(plan.slot.id, { status: "failed", phase: "failed", error: errorMessage });
-                items.push({ status: "failed", error: errorMessage });
-            }
-            if (index < jobPlans.length - 1) {
-                await sleep(aestheticMirrorBatchRequestGapMs);
-            }
-        }
-        return items;
+                        dataUrl: imageDataUrl,
+                        width: completed.width,
+                        height: completed.height,
+                        actualSize: completed.actualSize,
+                        requestedAspectRatio: completed.requestedAspectRatio,
+                        requestedImageSize: completed.requestedImageSize,
+                        resolvedUpstreamSize: completed.resolvedUpstreamSize,
+                        error: undefined,
+                    });
+                    return {
+                        status: "success" as const,
+                        image: {
+                            id: plan.slot.id,
+                            dataUrl: imageDataUrl,
+                            prompt: completed.resolvedPrompt || plan.slot.prompt,
+                            referenceIndex: plan.referenceIndex,
+                            referenceName: plan.reference.name,
+                            groupIndex: plan.groupIndex,
+                        },
+                    };
+                } catch (error) {
+                    const errorMessage = error instanceof Error ? error.message : "生成失败";
+                    updateResult(plan.slot.id, { status: "failed", phase: "failed", error: errorMessage });
+                    return { status: "failed" as const, error: errorMessage };
+                }
+            }),
+        );
     };
 
     const submitGenerate = async (override?: { count?: number; replaceId?: string }) => {
