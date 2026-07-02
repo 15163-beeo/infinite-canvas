@@ -10,10 +10,12 @@ export type AestheticMirrorJobImagePayload = {
 };
 
 export type AestheticMirrorJobPayload = {
+    mode?: "aesthetic_mirror" | "sku_replace";
     prompt?: string;
     promptTemplate?: string;
     extraPrompt?: string;
     userPrompt?: string;
+    skuText?: string;
     model: string;
     channelId: string;
     aspectRatio?: string;
@@ -26,6 +28,8 @@ export type AestheticMirrorJobPayload = {
     metadata: {
         referenceIndex: number;
         groupIndex: number;
+        skuIndex?: number;
+        skuName?: string;
         isBatch?: boolean;
         runId?: string;
     };
@@ -33,10 +37,13 @@ export type AestheticMirrorJobPayload = {
 
 export type AestheticMirrorJob = {
     id: string;
+    mode?: "aesthetic_mirror" | "sku_replace";
     status: "queued" | "running" | "success" | "failed";
     phase: "queued" | "analyzing" | "generating" | "success" | "failed";
     referenceIndex: number;
     groupIndex: number;
+    skuIndex?: number;
+    skuName?: string;
     resolvedPrompt?: string;
     requestedAspectRatio?: string;
     requestedImageSize?: string;

@@ -99,6 +99,10 @@ You must abide by the following rules strictly:
 7.All outputs shall be optimized for e-commerce conversion, featuring crisp, professional visuals fully eligible for commercial use.`
 
 func buildAestheticMirrorJobPrompt(ctx context.Context, user model.AuthUser, input AestheticMirrorJobCreateInput) string {
+	if isAestheticMirrorSKUReplaceMode(input) {
+		return buildAestheticMirrorSKUReplacePrompt(input)
+	}
+
 	fallbackPrompt := strings.TrimSpace(input.Prompt)
 	template := strings.TrimSpace(firstNonEmptyString(input.PromptTemplate, aestheticMirrorBasePrompt))
 	if template == "" {
@@ -127,6 +131,66 @@ func buildAestheticMirrorJobPrompt(ctx context.Context, user model.AuthUser, inp
 		return prompt
 	}
 	return fallbackPrompt
+}
+
+func buildAestheticMirrorSKUReplacePrompt(input AestheticMirrorJobCreateInput) string {
+	parts := []string{
+		`【SKU替换】关键词  1.1版本
+
+你是专业的电商商品图像编辑 AI 专家，任务是进行 SKU 产品替换。
+请将【参考图】中的原商品替换为【产品素材图】中的商品。
+
+核心要求：
+1. 只替换参考图中的目标商品，不改变其他画面元素。
+
+2. 替换后的商品必须严格依据【产品素材图】，保留其真实外观、包装结构、文字、品牌 LOGO、颜色、图案、比例、材质、纹理和细节。
+3. 商品的摆放位置、尺寸比例、拍摄角度、透视关系、光照方向、接触阴影和投影，需要自然匹配【参考图】的场景。
+4. 除目标商品区域及必要的边缘融合、光影融合、阴影融合外，背景、文字、排版、装饰元素、人物、道具、其他商品、画面清晰度和整体风格必须保持不变。
+
+严格禁止：
+1. 不得修改、重绘、虚构、模糊或替换商品包装上的文字、品牌 LOGO、图案、条码和标签信息。
+2. 不得改变参考图中的背景文字、促销文案、排版布局和设计元素。
+3. 不得新增无关商品、装饰、文字、水印或品牌元素。
+4. 不得改变商品品类、包装形态、颜色体系和SKU识别特征。
+5. 不得将产品美化成与【产品素材图】不一致的新商品。
+
+输出目标：
+生成一张自然、真实、可用于电商展示的 SKU 替换图。画面应看起来像原本就是在该场景中拍摄的商品图。
+
+You are a professional e-commerce product image editing AI specialist tasked with SKU product replacement. Please replace the original product in the Reference Image with the product from the Product Material Image.
+
+Core Requirements: 
+1.Only replace the target product in the reference image; all other visual elements shall remain untouched. 
+2. The replaced product must strictly follow the Product Material Image, retaining its authentic appearance, packaging structure, text, brand logos, colors, patterns, proportions, materials, textures and fine details.
+3. The product’s placement, size ratio, shooting angle, perspective, light source direction, contact shadows and drop shadows shall naturally match the scene of the Reference Image. 
+4. Except for the target product area and essential edge, light and shadow blending, the background, text, layout, decorative elements, characters, props, other products, image sharpness and overall style must stay unchanged.  
+
+Strict Prohibitions: 
+1.Do not alter, redraw, fabricate, blur or replace any text, brand logos, patterns, barcodes and label information on the product packaging. 
+2. Do not modify background text, promotional copy, layout and design elements in the reference image.
+3. Do not add irrelevant products, decorations, text, watermarks or brand elements.
+4. Do not change the product category, packaging form, color scheme and SKU identifying features.
+5. Do not retouch the product into a new item inconsistent with the Product Material Image. 
+
+Output Objective: 
+Generate a natural, realistic SKU replacement image suitable for e-commerce display. The final image must look as if the product was originally shot in this scene.`,
+		fmt.Sprintf("当前 SKU 序号：%d。", input.Metadata.SKUIndex+1),
+	}
+
+	if ratio := strings.TrimSpace(input.AspectRatio); ratio != "" {
+		parts = append(parts, "请求画面比例："+ratio+"。")
+	}
+	if skuText := strings.TrimSpace(firstNonEmptyString(input.SKUText, input.UserPrompt, input.ExtraPrompt)); skuText != "" {
+		parts = append(parts, "用户对当前 SKU 的补充要求："+skuText)
+	}
+
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			filtered = append(filtered, trimmed)
+		}
+	}
+	return strings.Join(filtered, "\n\n")
 }
 
 func analyzeAestheticMirrorReference(ctx context.Context, user model.AuthUser, input AestheticMirrorJobCreateInput) (*aestheticMirrorReferenceAnalysis, error) {

@@ -57,6 +57,11 @@ const (
 	aestheticMirrorAspectRatioTolerance           = 0.03
 )
 
+const (
+	aestheticMirrorModeDefault    = "aesthetic_mirror"
+	aestheticMirrorModeSKUReplace = "sku_replace"
+)
+
 type AestheticMirrorJobImageInput struct {
 	Name       string `json:"name"`
 	Type       string `json:"type"`
@@ -67,15 +72,19 @@ type AestheticMirrorJobImageInput struct {
 type AestheticMirrorJobMetadata struct {
 	ReferenceIndex int    `json:"referenceIndex"`
 	GroupIndex     int    `json:"groupIndex"`
+	SKUIndex       int    `json:"skuIndex"`
+	SKUName        string `json:"skuName"`
 	IsBatch        bool   `json:"isBatch"`
 	RunID          string `json:"runId"`
 }
 
 type AestheticMirrorJobCreateInput struct {
+	Mode           string                         `json:"mode"`
 	Prompt         string                         `json:"prompt"`
 	PromptTemplate string                         `json:"promptTemplate"`
 	ExtraPrompt    string                         `json:"extraPrompt"`
 	UserPrompt     string                         `json:"userPrompt"`
+	SKUText        string                         `json:"skuText"`
 	Model          string                         `json:"model"`
 	ChannelID      string                         `json:"channelId"`
 	AspectRatio    string                         `json:"aspectRatio"`
@@ -90,10 +99,13 @@ type AestheticMirrorJobCreateInput struct {
 
 type AestheticMirrorJob struct {
 	ID                   string                   `json:"id"`
+	Mode                 string                   `json:"mode,omitempty"`
 	Status               AestheticMirrorJobStatus `json:"status"`
 	Phase                AestheticMirrorJobPhase  `json:"phase"`
 	ReferenceIndex       int                      `json:"referenceIndex"`
 	GroupIndex           int                      `json:"groupIndex"`
+	SKUIndex             int                      `json:"skuIndex,omitempty"`
+	SKUName              string                   `json:"skuName,omitempty"`
 	ResolvedPrompt       string                   `json:"resolvedPrompt,omitempty"`
 	RequestedAspectRatio string                   `json:"requestedAspectRatio,omitempty"`
 	RequestedImageSize   string                   `json:"requestedImageSize,omitempty"`
@@ -189,6 +201,9 @@ func CreateAestheticMirrorJob(ctx context.Context, token string, input Aesthetic
 	if len(input.ProductImages) == 0 {
 		return AestheticMirrorJob{}, safeMessageError{message: "产品素材图不能为空"}
 	}
+	if isAestheticMirrorSKUReplaceMode(input) && len(input.ProductImages) != 1 {
+		return AestheticMirrorJob{}, safeMessageError{message: "SKU替换每个任务只能传一张产品图"}
+	}
 	if !isValidAestheticMirrorImageInput(input.ReferenceImage) {
 		return AestheticMirrorJob{}, safeMessageError{message: "参考设计图不能为空"}
 	}
@@ -197,10 +212,13 @@ func CreateAestheticMirrorJob(ctx context.Context, token string, input Aesthetic
 	job := aestheticMirrorStoredJob{
 		AestheticMirrorJob: AestheticMirrorJob{
 			ID:             uuid.NewString(),
+			Mode:           normalizeAestheticMirrorMode(input.Mode),
 			Status:         AestheticMirrorJobQueued,
 			Phase:          AestheticMirrorJobPhaseQueued,
 			ReferenceIndex: input.Metadata.ReferenceIndex,
 			GroupIndex:     input.Metadata.GroupIndex,
+			SKUIndex:       input.Metadata.SKUIndex,
+			SKUName:        strings.TrimSpace(input.Metadata.SKUName),
 			CreatedAt:      now,
 		},
 		OwnerUserID: user.ID,
@@ -1177,4 +1195,19 @@ func firstNonEmptyString(values ...string) string {
 
 func isValidAestheticMirrorImageInput(input AestheticMirrorJobImageInput) bool {
 	return strings.TrimSpace(input.StorageKey) != "" || strings.TrimSpace(input.DataURL) != ""
+}
+
+func normalizeAestheticMirrorMode(value string) string {
+	switch strings.TrimSpace(value) {
+	case "", aestheticMirrorModeDefault:
+		return aestheticMirrorModeDefault
+	case aestheticMirrorModeSKUReplace:
+		return aestheticMirrorModeSKUReplace
+	default:
+		return aestheticMirrorModeDefault
+	}
+}
+
+func isAestheticMirrorSKUReplaceMode(input AestheticMirrorJobCreateInput) bool {
+	return normalizeAestheticMirrorMode(input.Mode) == aestheticMirrorModeSKUReplace
 }

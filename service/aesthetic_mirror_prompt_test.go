@@ -52,6 +52,36 @@ func TestBuildAestheticMirrorTaskPromptPrefersExplicitRule(t *testing.T) {
 	}
 }
 
+func TestBuildAestheticMirrorSKUReplacePrompt(t *testing.T) {
+	prompt := buildAestheticMirrorSKUReplacePrompt(AestheticMirrorJobCreateInput{
+		Mode:        "sku_replace",
+		SKUText:     "突出静音和便携",
+		AspectRatio: "1:1",
+		Metadata:    AestheticMirrorJobMetadata{SKUIndex: 2},
+	})
+	if !strings.Contains(prompt, "【SKU替换】关键词  1.1版本") {
+		t.Fatalf("expected sku prompt version in prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "请将【参考图】中的原商品替换为【产品素材图】中的商品") {
+		t.Fatalf("expected reference image role in prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "背景、文字、排版、装饰元素、人物、道具、其他商品、画面清晰度和整体风格必须保持不变") {
+		t.Fatalf("expected unchanged scene rule in prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "不得修改、重绘、虚构、模糊或替换商品包装上的文字") {
+		t.Fatalf("expected product preservation rule in prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "突出静音和便携") {
+		t.Fatalf("expected sku text in prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "请求画面比例：1:1") {
+		t.Fatalf("expected aspect ratio in prompt: %s", prompt)
+	}
+	if !strings.Contains(prompt, "当前 SKU 序号：3") {
+		t.Fatalf("expected sku index in prompt: %s", prompt)
+	}
+}
+
 func TestValidateAestheticMirrorResultDimensions(t *testing.T) {
 	dataURL := testAestheticMirrorPNGDataURL(t, 12, 16)
 	if _, err := validateAestheticMirrorResultDimensions(dataURL, "3:4", "12x16"); err != nil {

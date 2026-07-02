@@ -22,7 +22,7 @@ import type { ReferenceImage } from "@/types/image";
 type UploadRole = "reference" | "product";
 type MirrorStatus = "idle" | "running" | "success" | "failed";
 type MirrorPhase = "queued" | "analyzing" | "generating" | "success" | "failed";
-type MirrorMode = "single" | "batch";
+type MirrorMode = "single" | "batch" | "sku_replace";
 
 type MirrorResult = {
     id: string;
@@ -34,6 +34,8 @@ type MirrorResult = {
     referenceName?: string;
     referenceIndex?: number;
     groupIndex?: number;
+    skuIndex?: number;
+    skuName?: string;
     dataUrl?: string;
     width?: number;
     height?: number;
@@ -55,6 +57,8 @@ type MirrorHistoryImage = {
     referenceIndex?: number;
     referenceName?: string;
     groupIndex?: number;
+    skuIndex?: number;
+    skuName?: string;
     prompt?: string;
 };
 
@@ -65,6 +69,8 @@ type MirrorHistoryLog = {
     prompt: string;
     promptTemplate: string;
     extraPrompt: string;
+    mode: MirrorMode;
+    skuTexts?: Record<string, string>;
     model: string;
     modelChannelId: string;
     modelChannelName: string;
@@ -96,7 +102,18 @@ type ParsedReferenceRules = {
     rules: Record<number, ReferenceRule>;
 };
 
+type MirrorJobPlan = {
+    slot: MirrorResult;
+    reference: ReferenceImage;
+    referenceIndex: number;
+    groupIndex: number;
+    product?: ReferenceImage;
+    productIndex?: number;
+    skuText?: string;
+};
+
 const maxProductImages = 6;
+const maxSkuProductImages = 20;
 const singleModeReferenceLimit = 1;
 const batchModeReferenceLimit = 20;
 const maxMirrorHistoryLogs = 50;
@@ -218,6 +235,7 @@ export default function AestheticMirrorPage() {
     const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>([]);
     const [productImages, setProductImages] = useState<ReferenceImage[]>([]);
     const [extraPrompt, setExtraPrompt] = useState("");
+    const [skuTexts, setSkuTexts] = useState<Record<string, string>>({});
     const [model, setModel] = useState(effectiveConfig.imageModel || effectiveConfig.model);
     const [modelChannelId, setModelChannelId] = useState(effectiveConfig.imageChannelId || effectiveConfig.activeChannelId);
     const [aspectRatio, setAspectRatio] = useState<AspectRatio>("1:1");
@@ -235,8 +253,10 @@ export default function AestheticMirrorPage() {
     const isGenerating = results.some((item) => item.status === "running");
     const modelChannelName = useMemo(() => resolveModelChannelName(effectiveConfig, modelChannelId, model), [effectiveConfig, model, modelChannelId]);
     const isBatchMode = mirrorMode === "batch";
+    const isSkuReplaceMode = mirrorMode === "sku_replace";
     const referenceLimit = isBatchMode ? batchModeReferenceLimit : singleModeReferenceLimit;
-    const effectiveResultCount = isBatchMode ? Math.max(1, referenceImages.length) * imageCount : imageCount;
+    const productLimit = isSkuReplaceMode ? maxSkuProductImages : maxProductImages;
+    const effectiveResultCount = isSkuReplaceMode ? productImages.length : isBatchMode ? Math.max(1, referenceImages.length) * imageCount : imageCount;
     const canGenerate = referenceImages.length > 0 && productImages.length > 0 && !isGenerating;
     const successCount = results.filter((item) => item.status === "success").length;
 
@@ -251,9 +271,15 @@ export default function AestheticMirrorPage() {
 
     const changeMirrorMode = (nextMode: MirrorMode) => {
         if (nextMode === mirrorMode) return;
-        if (nextMode === "single" && referenceImages.length > 1) {
+        if (nextMode !== "batch" && referenceImages.length > 1) {
             setReferenceImages((items) => items.slice(0, singleModeReferenceLimit));
-            message.info("已切到单图复刻，仅保留第一张参考图");
+            message.info(nextMode === "sku_replace" ? "已切到SKU替换，仅保留第一张参考图" : "已切到单图复刻，仅保留第一张参考图");
+        }
+        const nextProductLimit = nextMode === "sku_replace" ? maxSkuProductImages : maxProductImages;
+        if (productImages.length > nextProductLimit) {
+            const keptProductIds = new Set(productImages.slice(0, nextProductLimit).map((image) => image.id));
+            setProductImages((items) => items.slice(0, nextProductLimit));
+            setSkuTexts((items) => Object.fromEntries(Object.entries(items).filter(([id]) => keptProductIds.has(id))));
         }
         setMirrorMode(nextMode);
     };
@@ -261,11 +287,11 @@ export default function AestheticMirrorPage() {
     const uploadFiles = async (sourceFiles: File[], role: UploadRole) => {
         const files = sourceFiles.filter((file) => file.type.startsWith("image/"));
         if (!files.length) return;
-        const maxImages = role === "reference" ? referenceLimit : maxProductImages;
+        const maxImages = role === "reference" ? referenceLimit : productLimit;
         const currentCount = role === "reference" ? referenceImages.length : productImages.length;
         const limitedFiles = role === "reference" && !isBatchMode ? files.slice(0, maxImages) : files.slice(0, Math.max(0, maxImages - currentCount));
         if (!limitedFiles.length) {
-            message.warning(role === "reference" ? `参考设计图最多上传 ${maxImages} 张` : `产品素材最多上传 ${maxProductImages} 张`);
+            message.warning(role === "reference" ? `参考设计图最多上传 ${maxImages} 张` : `产品素材最多上传 ${maxImages} 张`);
             return;
         }
         const hide = message.loading("正在读取图片...", 0);
@@ -290,7 +316,7 @@ export default function AestheticMirrorPage() {
             if (role === "reference") {
                 setReferenceImages((items) => (isBatchMode ? [...items, ...nextImages].slice(0, referenceLimit) : nextImages.slice(0, referenceLimit)));
             } else {
-                setProductImages((items) => [...items, ...nextImages].slice(0, maxProductImages));
+                setProductImages((items) => [...items, ...nextImages].slice(0, productLimit));
             }
         } catch (error) {
             message.error(error instanceof Error ? error.message : "图片上传失败");
@@ -310,7 +336,14 @@ export default function AestheticMirrorPage() {
         const target = list.find((item) => item.id === id);
         if (target) await cleanupStoredImages([target]).catch(() => undefined);
         if (role === "reference") setReferenceImages((items) => items.filter((item) => item.id !== id));
-        else setProductImages((items) => items.filter((item) => item.id !== id));
+        else {
+            setProductImages((items) => items.filter((item) => item.id !== id));
+            setSkuTexts((items) => {
+                const next = { ...items };
+                delete next[id];
+                return next;
+            });
+        }
     };
 
     const updateResult = (id: string, patch: Partial<MirrorResult>) => {
@@ -370,22 +403,28 @@ export default function AestheticMirrorPage() {
     };
 
     const runMirrorJobs = async (
-        jobPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }>,
+        jobPlans: MirrorJobPlan[],
         requestModel: string,
         requestChannelId: string,
         runId: string,
         isBatchRun: boolean,
+        isSkuReplaceRun: boolean,
     ) => {
         const [preparedReferences, preparedProducts] = await Promise.all([Promise.all(referenceImages.map((image) => prepareJobImage(image))), Promise.all(productImages.map((image) => prepareJobImage(image)))]);
         return Promise.all(
             jobPlans.map(async (plan) => {
                 try {
                     updateResult(plan.slot.id, { status: "running", phase: "queued", error: undefined });
+                    const skuProduct = preparedProducts[plan.productIndex ?? -1];
+                    const jobProductImages = isSkuReplaceRun && skuProduct ? [skuProduct] : preparedProducts;
+                    if (!jobProductImages.length) throw new Error(isSkuReplaceRun ? "SKU产品图不能为空" : "产品素材图不能为空");
                     const completed = await createAndWaitForJobWithRetry(
                         {
+                            mode: isSkuReplaceRun ? "sku_replace" : "aesthetic_mirror",
                             promptTemplate,
                             extraPrompt,
                             userPrompt: extraPrompt,
+                            skuText: isSkuReplaceRun ? [extraPrompt.trim(), plan.skuText?.trim()].filter(Boolean).join("\n") : undefined,
                             model: requestModel,
                             channelId: requestChannelId,
                             aspectRatio,
@@ -393,8 +432,8 @@ export default function AestheticMirrorPage() {
                             quality: quality,
                             outputFormat: "png",
                             referenceImage: preparedReferences[plan.referenceIndex],
-                            productImages: preparedProducts,
-                            metadata: { referenceIndex: plan.referenceIndex, groupIndex: plan.groupIndex, isBatch: isBatchRun, runId },
+                            productImages: jobProductImages,
+                            metadata: { referenceIndex: plan.referenceIndex, groupIndex: plan.groupIndex, skuIndex: plan.productIndex, skuName: plan.product?.name, isBatch: isBatchRun, runId },
                         },
                         plan.slot.id,
                     );
@@ -423,6 +462,8 @@ export default function AestheticMirrorPage() {
                             referenceIndex: plan.referenceIndex,
                             referenceName: plan.reference.name,
                             groupIndex: plan.groupIndex,
+                            skuIndex: plan.productIndex,
+                            skuName: plan.product?.name,
                         },
                     };
                 } catch (error) {
@@ -436,12 +477,13 @@ export default function AestheticMirrorPage() {
 
     const submitGenerate = async (override?: { count?: number; replaceId?: string }) => {
         const availableReferences = (isBatchMode ? referenceImages : referenceImages.slice(0, 1)).slice(0, referenceLimit);
+        const availableProducts = (isSkuReplaceMode ? productImages.slice(0, maxSkuProductImages) : productImages.slice(0, maxProductImages));
         if (!availableReferences.length) {
             message.warning("请先上传参考设计图");
             return;
         }
-        if (!productImages.length) {
-            message.warning("请先上传产品素材图");
+        if (!availableProducts.length) {
+            message.warning(isSkuReplaceMode ? "请先上传SKU产品图" : "请先上传产品素材图");
             return;
         }
         const requestModel = model || effectiveConfig.imageModel || effectiveConfig.model;
@@ -458,7 +500,8 @@ export default function AestheticMirrorPage() {
         }
 
         const isBatchRun = isBatchMode && !override?.replaceId;
-        const promptDisplayText = extraPrompt.trim() || "系统模板";
+        const isSkuReplaceRun = isSkuReplaceMode;
+        const promptDisplayText = extraPrompt.trim() || (isSkuReplaceRun ? "SKU替换模板" : "系统模板");
         const runId = nanoid();
         const targetResult = override?.replaceId ? results.find((item) => item.id === override.replaceId) : undefined;
         if (override?.replaceId && !targetResult) {
@@ -467,12 +510,19 @@ export default function AestheticMirrorPage() {
         }
 
         let selectedReferences = availableReferences;
-        let jobPlans: Array<{ slot: MirrorResult; reference: ReferenceImage; referenceIndex: number; groupIndex: number }> = [];
+        let selectedProducts = availableProducts;
+        let jobPlans: MirrorJobPlan[] = [];
         if (targetResult) {
             const targetReferenceIndex = targetResult.referenceIndex ?? 0;
             const targetReference = availableReferences[targetReferenceIndex];
             if (!targetReference) {
                 message.warning("当前图片对应的参考图不存在");
+                return;
+            }
+            const targetProductIndex = targetResult.skuIndex ?? 0;
+            const targetProduct = isSkuReplaceRun ? availableProducts[targetProductIndex] : undefined;
+            if (isSkuReplaceRun && !targetProduct) {
+                message.warning("当前SKU产品图不存在");
                 return;
             }
             jobPlans = [
@@ -486,12 +536,39 @@ export default function AestheticMirrorPage() {
                         referenceName: targetReference.name,
                         referenceIndex: targetReferenceIndex,
                         groupIndex: targetResult.groupIndex ?? 0,
+                        skuIndex: isSkuReplaceRun ? targetProductIndex : undefined,
+                        skuName: targetProduct?.name,
                     },
                     reference: targetReference,
                     referenceIndex: targetReferenceIndex,
                     groupIndex: targetResult.groupIndex ?? 0,
+                    product: targetProduct,
+                    productIndex: isSkuReplaceRun ? targetProductIndex : undefined,
+                    skuText: targetProduct ? skuTexts[targetProduct.id] : undefined,
                 },
             ];
+        } else if (isSkuReplaceRun) {
+            const targetReference = selectedReferences[0];
+            jobPlans = selectedProducts.map((product, productIndex) => ({
+                slot: {
+                    id: nanoid(),
+                    status: "idle" as const,
+                    phase: "queued" as const,
+                    prompt: [promptDisplayText, skuTexts[product.id]?.trim()].filter(Boolean).join("\n"),
+                    referenceId: targetReference.id,
+                    referenceName: targetReference.name,
+                    referenceIndex: 0,
+                    groupIndex: 0,
+                    skuIndex: productIndex,
+                    skuName: product.name,
+                },
+                reference: targetReference,
+                referenceIndex: 0,
+                groupIndex: 0,
+                product,
+                productIndex,
+                skuText: skuTexts[product.id],
+            }));
         } else {
             const jobCountPerReference = isBatchRun ? imageCount : Math.max(1, override?.count || imageCount);
             jobPlans = selectedReferences.flatMap((reference, referenceIndex) =>
@@ -514,10 +591,13 @@ export default function AestheticMirrorPage() {
         }
         const count = jobPlans.length;
         const startedAt = performance.now();
-        const historySnapshot = {
+        const historyMode: MirrorMode = isSkuReplaceRun ? "sku_replace" : mirrorMode;
+        const historySnapshot: Omit<MirrorHistoryBuildInput, "id" | "createdAt" | "status" | "images" | "errors" | "durationMs"> = {
             prompt: promptDisplayText,
             promptTemplate,
             extraPrompt,
+            mode: historyMode,
+            skuTexts: isSkuReplaceRun ? { ...skuTexts } : undefined,
             model: requestModel,
             modelChannelId: requestChannelId,
             modelChannelName,
@@ -527,7 +607,7 @@ export default function AestheticMirrorPage() {
             count,
             groupCount: targetResult ? 1 : isBatchRun ? imageCount : 1,
             references: [...selectedReferences],
-            products: [...productImages],
+            products: [...selectedProducts],
         };
         const slots = jobPlans.map((plan) => plan.slot);
         if (override?.replaceId) {
@@ -540,20 +620,11 @@ export default function AestheticMirrorPage() {
         const historyLogMeta = pendingLog ? { id: pendingLog.id, createdAt: pendingLog.createdAt } : {};
 
         try {
-            const jobItems = await runMirrorJobs(jobPlans, requestModel, requestChannelId, runId, isBatchRun);
-            const images = jobItems
-                .filter(
-                    (
-                        item,
-                    ): item is {
-                        status: "success";
-                        image: { id: string; dataUrl: string; prompt: string; referenceIndex: number; referenceName: string; groupIndex: number };
-                    } => item.status === "success",
-                )
-                .map((item) => item.image);
+            const jobItems = await runMirrorJobs(jobPlans, requestModel, requestChannelId, runId, isBatchRun, isSkuReplaceRun);
+            const images = jobItems.flatMap((item) => (item.status === "success" ? [item.image] : []));
             const errors = jobItems.filter((item): item is { status: "failed"; error: string } => item.status === "failed").map((item) => item.error);
             if (images.length > 0) {
-                message.success(isBatchRun ? `已生成 ${images.length}/${count} 张详情图` : `已生成 ${images.length} 张详情图`);
+                message.success(isSkuReplaceRun ? `已生成 ${images.length}/${count} 张SKU图` : isBatchRun ? `已生成 ${images.length}/${count} 张详情图` : `已生成 ${images.length} 张详情图`);
             }
             if (!images.length) message.error(errors[0] || "生成失败");
             else if (errors.length) message.warning(`有 ${errors.length} 张生成失败`);
@@ -627,12 +698,14 @@ export default function AestheticMirrorPage() {
     };
 
     const restoreHistoryLog = (log: MirrorHistoryLog) => {
-        const nextMode: MirrorMode = log.references.length > 1 ? "batch" : "single";
+        const nextMode: MirrorMode = log.mode === "sku_replace" ? "sku_replace" : log.references.length > 1 ? "batch" : "single";
         const nextReferenceLimit = nextMode === "batch" ? batchModeReferenceLimit : singleModeReferenceLimit;
+        const nextProductLimit = nextMode === "sku_replace" ? maxSkuProductImages : maxProductImages;
         setMirrorMode(nextMode);
         setReferenceImages(log.references.slice(0, nextReferenceLimit));
-        setProductImages(log.products.slice(0, maxProductImages));
+        setProductImages(log.products.slice(0, nextProductLimit));
         setExtraPrompt(log.extraPrompt || "");
+        setSkuTexts(log.skuTexts || {});
         setModel(log.model || effectiveConfig.imageModel || effectiveConfig.model);
         setModelChannelId(log.modelChannelId || "");
         if (log.model) updateConfig("imageModel", log.model);
@@ -640,7 +713,7 @@ export default function AestheticMirrorPage() {
         setAspectRatio(log.aspectRatio || "1:1");
         setImageSize(log.imageSize || "1K");
         setQuality(log.quality || "auto");
-        setImageCount(nextMode === "batch" ? resolveHistoryGroupCount(log) : Math.max(1, Math.min(4, log.count || log.images.length || 1)));
+        setImageCount(nextMode === "batch" ? resolveHistoryGroupCount(log) : nextMode === "sku_replace" ? 1 : Math.max(1, Math.min(4, log.count || log.images.length || 1)));
         setResults(
             log.images.length
                 ? log.images.map((image) => {
@@ -657,6 +730,8 @@ export default function AestheticMirrorPage() {
                           referenceName: image.referenceName || reference?.name,
                           referenceIndex: image.referenceIndex,
                           groupIndex: image.groupIndex,
+                          skuIndex: image.skuIndex,
+                          skuName: image.skuName,
                       };
                   })
                 : [{ id: log.id, status: log.status === "生成中" ? "running" : "failed", phase: log.status === "生成中" ? "generating" : "failed", prompt: log.prompt, error: log.errors[0] || (log.status === "生成中" ? undefined : "生成失败") }],
@@ -711,7 +786,7 @@ export default function AestheticMirrorPage() {
                                         onClick={() => changeMirrorMode("single")}
                                         className={cn(
                                             "rounded-md border px-3 py-1.5 text-sm font-medium transition",
-                                            !isBatchMode
+                                            mirrorMode === "single"
                                                 ? "border-stone-900 bg-stone-950 text-white dark:border-cyan-500/40 dark:bg-cyan-500/18 dark:text-cyan-100"
                                                 : "border-stone-300 bg-white text-stone-700 hover:border-stone-400 dark:border-stone-700 dark:bg-stone-950 dark:text-stone-300 dark:hover:border-stone-500 dark:hover:text-stone-100",
                                         )}
@@ -730,6 +805,18 @@ export default function AestheticMirrorPage() {
                                     >
                                         批量复刻
                                     </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => changeMirrorMode("sku_replace")}
+                                        className={cn(
+                                            "rounded-md border px-3 py-1.5 text-sm font-medium transition",
+                                            isSkuReplaceMode
+                                                ? "border-stone-900 bg-stone-950 text-white dark:border-cyan-500/40 dark:bg-cyan-500/18 dark:text-cyan-100"
+                                                : "border-stone-300 bg-white text-stone-700 hover:border-stone-400 dark:border-stone-700 dark:bg-stone-950 dark:text-stone-300 dark:hover:border-stone-500 dark:hover:text-stone-100",
+                                        )}
+                                    >
+                                        SKU替换
+                                    </button>
                                 </div>
                             </div>
                             <Tooltip title="打开模型配置">
@@ -740,10 +827,10 @@ export default function AestheticMirrorPage() {
 
                     <div className="thin-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
                         <UploadPanel
-                            title="参考设计图"
+                            title={isSkuReplaceMode ? "参考图" : "参考设计图"}
                             subtitle={`${referenceImages.length}/${referenceLimit}`}
                             images={referenceImages}
-                            emptyText={isBatchMode ? "上传多张风格参考" : "上传风格参考"}
+                            emptyText={isSkuReplaceMode ? "上传需要替换SKU的原图" : isBatchMode ? "上传多张风格参考" : "上传风格参考"}
                             maxImages={referenceLimit}
                             singlePreview={!isBatchMode}
                             onUpload={() => referenceInputRef.current?.click()}
@@ -752,19 +839,31 @@ export default function AestheticMirrorPage() {
                             onRemove={(id) => void removeImage("reference", id)}
                         />
                         <UploadPanel
-                            title="产品素材图"
-                            subtitle={`${productImages.length}/${maxProductImages}`}
+                            title={isSkuReplaceMode ? "SKU 产品图" : "产品素材图"}
+                            subtitle={`${productImages.length}/${productLimit}`}
                             images={productImages}
-                            emptyText="上传产品图片"
-                            maxImages={maxProductImages}
+                            emptyText={isSkuReplaceMode ? "上传SKU产品图" : "上传产品图片"}
+                            maxImages={productLimit}
                             onUpload={() => productInputRef.current?.click()}
                             onDropFiles={(files) => void uploadFiles(files, "product")}
+                            onPreview={(image) => setActiveUploadPreview(image)}
                             onRemove={(id) => void removeImage("product", id)}
+                            noteValues={isSkuReplaceMode ? skuTexts : undefined}
+                            notePlaceholder="特殊需求"
+                            onNoteChange={
+                                isSkuReplaceMode
+                                    ? (id, value) =>
+                                          setSkuTexts((items) => ({
+                                              ...items,
+                                              [id]: value,
+                                          }))
+                                    : undefined
+                            }
                         />
 
                         <section className="space-y-2">
-                            <PanelHeader title="补充提示词" icon={<Sparkles className="size-4" />} />
-                            <Input.TextArea value={extraPrompt} onChange={(event) => setExtraPrompt(event.target.value)} placeholder="可补充产品卖点、目标平台、画面禁忌或文案要求" autoSize={{ minRows: 4, maxRows: 7 }} maxLength={600} showCount />
+                            <PanelHeader title={isSkuReplaceMode ? "全局补充要求" : "补充提示词"} icon={<Sparkles className="size-4" />} />
+                            <Input.TextArea value={extraPrompt} onChange={(event) => setExtraPrompt(event.target.value)} placeholder={isSkuReplaceMode ? "可补充所有SKU通用的卖点、目标平台、禁忌或文案要求" : "可补充产品卖点、目标平台、画面禁忌或文案要求"} autoSize={{ minRows: 4, maxRows: 7 }} maxLength={600} showCount />
                         </section>
 
                         <section className="space-y-3">
@@ -812,22 +911,28 @@ export default function AestheticMirrorPage() {
                                     />
                                 </ControlField>
                             </div>
-                            <div className="grid grid-cols-1 gap-2">
-                                <ControlField label={isBatchMode ? "每张参考图生成" : "数量"}>
-                                    <Select value={imageCount} options={[1, 2, 3, 4].map((value) => ({ label: isBatchMode ? `${value} 组` : `${value} 张`, value }))} onChange={setImageCount} />
-                                    {isBatchMode ? (
-                                        <div className="mt-1 text-xs text-stone-500">
-                                            {referenceImages.length} 张参考图 × {imageCount} 组 = {effectiveResultCount} 张
-                                        </div>
-                                    ) : null}
-                                </ControlField>
-                            </div>
+                            {!isSkuReplaceMode ? (
+                                <div className="grid grid-cols-1 gap-2">
+                                    <ControlField label={isBatchMode ? "每张参考图生成" : "数量"}>
+                                        <Select value={imageCount} options={[1, 2, 3, 4].map((value) => ({ label: isBatchMode ? `${value} 组` : `${value} 张`, value }))} onChange={setImageCount} />
+                                        {isBatchMode ? (
+                                            <div className="mt-1 text-xs text-stone-500">
+                                                {referenceImages.length} 张参考图 × {imageCount} 组 = {effectiveResultCount} 张
+                                            </div>
+                                        ) : null}
+                                    </ControlField>
+                                </div>
+                            ) : (
+                                <div className="rounded-md border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-500 dark:border-stone-800 dark:bg-stone-950">
+                                    SKU替换按产品图逐张生成：{productImages.length} 张SKU产品图 = {effectiveResultCount} 张结果
+                                </div>
+                            )}
                         </section>
                     </div>
 
                     <div className="shrink-0 border-t border-stone-200 p-4 dark:border-stone-800">
                         <Button type="primary" size="large" block icon={isGenerating ? <LoaderCircle className="size-4 animate-spin" /> : <Sparkles className="size-4" />} disabled={!canGenerate} onClick={() => void submitGenerate()}>
-                            {isGenerating ? "正在生成" : `生成 ${effectiveResultCount} 张详情图`}
+                            {isGenerating ? "正在生成" : `生成 ${effectiveResultCount} 张${isSkuReplaceMode ? "SKU图" : "详情图"}`}
                         </Button>
                         <div className="mt-2 flex items-center justify-between text-xs text-stone-500">
                             <span>{aspectRatioOptions.find((item) => item.value === aspectRatio)?.hint}</span>
@@ -845,7 +950,7 @@ export default function AestheticMirrorPage() {
                                 </Tag>
                                 {isGenerating ? <Tag className="m-0 border-stone-300 bg-stone-950 text-white dark:border-cyan-500/30 dark:bg-cyan-500/10 dark:text-cyan-200">生成中</Tag> : null}
                             </div>
-                            <p className="mt-1 truncate text-xs text-stone-500">参考设计图学习风格，产品素材图保持主体一致。</p>
+                            <p className="mt-1 truncate text-xs text-stone-500">{isSkuReplaceMode ? "参考图学习版式，每张SKU产品图独立替换生成。" : "参考设计图学习风格，产品素材图保持主体一致。"}</p>
                         </div>
                     <div className="flex shrink-0 gap-2">
                         <Button icon={<History className="size-4" />} onClick={() => setHistoryOpen(true)}>
@@ -902,6 +1007,9 @@ function UploadPanel({
     onDropFiles,
     onPreview,
     onRemove,
+    noteValues,
+    notePlaceholder,
+    onNoteChange,
 }: {
     title: string;
     subtitle: string;
@@ -913,6 +1021,9 @@ function UploadPanel({
     onDropFiles: (files: File[]) => void;
     onPreview?: (image: ReferenceImage) => void;
     onRemove: (id: string) => void;
+    noteValues?: Record<string, string>;
+    notePlaceholder?: string;
+    onNoteChange?: (id: string, value: string) => void;
 }) {
     const [dragging, setDragging] = useState(false);
     const handleDragEnter = (event: DragEvent<HTMLElement>) => {
@@ -990,24 +1101,27 @@ function UploadPanel({
                     ))}
                 </div>
             ) : images.length ? (
-                <div className={cn("grid grid-cols-3 gap-2 rounded-md", dragging && "outline outline-2 outline-cyan-500/70 outline-offset-2")} {...dropHandlers}>
+                <div className={cn("grid gap-2 rounded-md", onNoteChange ? "grid-cols-2" : "grid-cols-3", dragging && "outline outline-2 outline-cyan-500/70 outline-offset-2")} {...dropHandlers}>
                     {images.map((image) => (
-                        <div key={image.id} className="group relative overflow-hidden rounded-md border border-stone-200 bg-white dark:border-stone-800 dark:bg-black">
-                            {onPreview ? (
-                                <button type="button" className="block w-full cursor-zoom-in" onClick={() => onPreview(image)} aria-label="预览图片">
+                        <div key={image.id} className="space-y-1">
+                            <div className="group relative overflow-hidden rounded-md border border-stone-200 bg-white dark:border-stone-800 dark:bg-black">
+                                {onPreview ? (
+                                    <button type="button" className="block w-full cursor-zoom-in" onClick={() => onPreview(image)} aria-label="预览图片">
+                                        <img src={image.dataUrl} alt={image.name} className="aspect-square w-full object-cover" />
+                                    </button>
+                                ) : (
                                     <img src={image.dataUrl} alt={image.name} className="aspect-square w-full object-cover" />
+                                )}
+                                <button
+                                    type="button"
+                                    className="absolute right-1 top-1 grid size-7 place-items-center rounded-full border border-white/80 bg-black/80 text-white opacity-0 shadow-[0_3px_10px_rgba(0,0,0,0.45)] backdrop-blur transition hover:border-black/20 hover:bg-white hover:text-stone-950 group-hover:opacity-100"
+                                    onClick={() => onRemove(image.id)}
+                                    aria-label="删除图片"
+                                >
+                                    <X className="size-4 stroke-[2.5]" />
                                 </button>
-                            ) : (
-                                <img src={image.dataUrl} alt={image.name} className="aspect-square w-full object-cover" />
-                            )}
-                            <button
-                                type="button"
-                                className="absolute right-1 top-1 grid size-7 place-items-center rounded-full border border-white/80 bg-black/80 text-white opacity-0 shadow-[0_3px_10px_rgba(0,0,0,0.45)] backdrop-blur transition hover:border-black/20 hover:bg-white hover:text-stone-950 group-hover:opacity-100"
-                                onClick={() => onRemove(image.id)}
-                                aria-label="删除图片"
-                            >
-                                <X className="size-4 stroke-[2.5]" />
-                            </button>
+                            </div>
+                            {onNoteChange ? <Input size="small" value={noteValues?.[image.id] || ""} placeholder={notePlaceholder || "补充要求"} maxLength={120} onChange={(event) => onNoteChange(image.id, event.target.value)} /> : null}
                         </div>
                     ))}
                     {canAddMore ? (
@@ -1145,7 +1259,7 @@ function ResultCard({
             <div className="p-3">
                 <div className="min-w-0">
                     <div className="truncate text-sm font-semibold text-stone-950 dark:text-white">{title}</div>
-                    {result.referenceName ? <div className="mt-0.5 truncate text-xs text-stone-500">{result.referenceName}</div> : null}
+                    {result.skuName || result.referenceName ? <div className="mt-0.5 truncate text-xs text-stone-500">{result.skuName || result.referenceName}</div> : null}
                     <div className="mt-0.5 text-xs text-stone-500">{statusText(result.status, result.phase)}</div>
                     {result.actualSize || result.resolvedUpstreamSize ? (
                         <div className="mt-0.5 text-[11px] text-stone-400">
@@ -1266,6 +1380,8 @@ type MirrorHistoryBuildInput = {
     prompt: string;
     promptTemplate: string;
     extraPrompt: string;
+    mode: MirrorMode;
+    skuTexts?: Record<string, string>;
     model: string;
     modelChannelId: string;
     modelChannelName: string;
@@ -1278,7 +1394,7 @@ type MirrorHistoryBuildInput = {
     status: MirrorHistoryLog["status"];
     references: ReferenceImage[];
     products: ReferenceImage[];
-    images: Array<{ id: string; dataUrl: string; prompt?: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>;
+    images: Array<{ id: string; dataUrl: string; prompt?: string; referenceIndex?: number; referenceName?: string; groupIndex?: number; skuIndex?: number; skuName?: string }>;
     errors: string[];
 };
 
@@ -1291,6 +1407,8 @@ async function buildMirrorHistoryLog(input: MirrorHistoryBuildInput): Promise<Mi
         prompt: input.prompt,
         promptTemplate: input.promptTemplate,
         extraPrompt: input.extraPrompt,
+        mode: input.mode,
+        skuTexts: input.skuTexts,
         model: input.model,
         modelChannelId: input.modelChannelId,
         modelChannelName: input.modelChannelName,
@@ -1332,6 +1450,7 @@ async function readMirrorHistoryLogs() {
 function normalizeMirrorHistoryLog(log: Partial<MirrorHistoryLog>): MirrorHistoryLog {
     const aspectRatio: AspectRatio = aspectRatioOptions.some((item) => item.value === log.aspectRatio) ? (log.aspectRatio as AspectRatio) : "1:1";
     const imageSize = log.imageSize === "auto" || log.imageSize === "1K" || log.imageSize === "2K" ? log.imageSize : "1K";
+    const mode: MirrorMode = log.mode === "sku_replace" ? "sku_replace" : log.mode === "batch" || (log.references?.length || 0) > 1 ? "batch" : "single";
     return {
         id: log.id || nanoid(),
         createdAt: log.createdAt || Date.now(),
@@ -1339,6 +1458,8 @@ function normalizeMirrorHistoryLog(log: Partial<MirrorHistoryLog>): MirrorHistor
         prompt: log.prompt || "",
         promptTemplate: basePrompt,
         extraPrompt: log.extraPrompt || "",
+        mode,
+        skuTexts: log.skuTexts || {},
         model: log.model || "",
         modelChannelId: log.modelChannelId || "",
         modelChannelName: log.modelChannelName || "",
@@ -1377,7 +1498,7 @@ async function cloneHistoryReference(image: ReferenceImage): Promise<ReferenceIm
     };
 }
 
-async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string; prompt?: string; referenceIndex?: number; referenceName?: string; groupIndex?: number }>) {
+async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string; prompt?: string; referenceIndex?: number; referenceName?: string; groupIndex?: number; skuIndex?: number; skuName?: string }>) {
     return Promise.all(
         images.map(async (image, index) => {
             const dataUrl = await historyImageToDataUrl({ dataUrl: image.dataUrl });
@@ -1393,6 +1514,8 @@ async function cloneHistoryImages(images: Array<{ id: string; dataUrl: string; p
                 referenceIndex: image.referenceIndex,
                 referenceName: image.referenceName,
                 groupIndex: image.groupIndex,
+                skuIndex: image.skuIndex,
+                skuName: image.skuName,
                 prompt: image.prompt,
             };
         }),
@@ -1468,6 +1591,8 @@ function normalizeHistoryImages(images: MirrorHistoryImage[]) {
             referenceIndex: image.referenceIndex,
             referenceName: image.referenceName,
             groupIndex: image.groupIndex,
+            skuIndex: image.skuIndex,
+            skuName: image.skuName,
             prompt: image.prompt,
         }));
 }
@@ -1660,6 +1785,7 @@ function resolveAestheticMirrorRequestSize(config: AiConfig, model: string, chan
 }
 
 function resultDisplayTitle(result: MirrorResult | MirrorHistoryImage, index: number) {
+    if (result.skuIndex !== undefined) return `SKU ${result.skuIndex + 1}`;
     const referenceLabel = result.referenceIndex !== undefined ? `参考 ${result.referenceIndex + 1}` : "";
     const groupLabel = result.groupIndex !== undefined ? `第 ${result.groupIndex + 1} 组` : "";
     const labels = [referenceLabel, groupLabel].filter(Boolean);
